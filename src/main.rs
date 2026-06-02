@@ -1,6 +1,7 @@
 mod app;
 mod git;
 mod plain;
+mod profile;
 mod render;
 mod worker;
 
@@ -44,6 +45,14 @@ struct Cli {
     /// Per-pull timeout in seconds (default: 30)
     #[arg(long, env = "PULL_TIMEOUT", default_value = "30")]
     timeout: u64,
+
+    /// Emit a per-repo timing report (slowest first) after the run
+    #[arg(long)]
+    profile: bool,
+
+    /// Write the profile report to this file instead of stderr
+    #[arg(long, value_name = "FILE")]
+    profile_out: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -71,11 +80,29 @@ async fn run() -> Result<i32> {
     // Determine whether to use TUI
     let use_tui = !cli.no_tui && io::stderr().is_terminal();
 
+    let profiling = profile::profile_enabled(cli.profile);
+
     if !use_tui {
-        return plain::run_plain(&cwd, max_jobs, cli.timeout, cli.no_worktrees).await;
+        return plain::run_plain(
+            &cwd,
+            max_jobs,
+            cli.timeout,
+            cli.no_worktrees,
+            profiling,
+            cli.profile_out.as_deref(),
+        )
+        .await;
     }
 
-    run_tui(cwd, max_jobs, cli.timeout, cli.no_worktrees).await
+    run_tui(
+        cwd,
+        max_jobs,
+        cli.timeout,
+        cli.no_worktrees,
+        profiling,
+        cli.profile_out,
+    )
+    .await
 }
 
 /// TUI entry point: sets up terminal, runs the event loop, and restores on exit.
@@ -84,6 +111,8 @@ async fn run_tui(
     max_jobs: usize,
     timeout_secs: u64,
     no_worktrees: bool,
+    profiling: bool,
+    profile_out: Option<PathBuf>,
 ) -> Result<i32> {
     // Discover repos
     let repo_paths = git::discover_repos(&cwd).await?;
@@ -136,14 +165,65 @@ async fn run_tui(
         app_state.lock().unwrap().worktrees_done = true;
     }
 
-    let exit_code = run_event_loop(&mut terminal, app_state).await?;
+    let exit_code = run_event_loop(&mut terminal, Arc::clone(&app_state)).await?;
 
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
+    // Emit the profile report only after the alternate screen is left so it
+    // doesn't corrupt the display.
+    if profiling {
+        let rows = build_profile_rows(&app_state);
+        let report = profile::format_report(rows);
+        emit_report(&report, profile_out.as_deref())?;
+    }
+
     Ok(exit_code)
+}
+
+/// Build profile rows from the shared repo state for the TUI run.
+fn build_profile_rows(app_state: &Arc<Mutex<AppState>>) -> Vec<profile::ProfileRow> {
+    let app = app_state.lock().unwrap();
+    app.repos
+        .iter()
+        .map(|repo| {
+            let state = repo.lock().unwrap();
+            let status = match &state.status {
+                RepoStatus::Updated => "updated",
+                RepoStatus::UpToDate => "uptodate",
+                RepoStatus::Skipped => "skipped",
+                RepoStatus::Failed => "failed",
+                RepoStatus::Running { .. } => "running",
+                RepoStatus::Queued => "queued",
+            };
+            let last_log_line = state
+                .log
+                .lines()
+                .iter()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .cloned()
+                .unwrap_or_default();
+            profile::ProfileRow {
+                name: state.name.clone(),
+                branch: state.branch.clone().unwrap_or_else(|| "?".to_string()),
+                status,
+                elapsed: state.elapsed.unwrap_or_default(),
+                last_log_line,
+            }
+        })
+        .collect()
+}
+
+/// Write the profile report to the given file, or to stderr if none.
+fn emit_report(report: &str, profile_out: Option<&std::path::Path>) -> Result<()> {
+    match profile_out {
+        Some(path) => std::fs::write(path, report)?,
+        None => eprint!("{report}"),
+    }
+    Ok(())
 }
 
 /// Main event loop: renders UI and handles keyboard input.

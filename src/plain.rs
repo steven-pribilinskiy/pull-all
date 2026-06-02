@@ -16,6 +16,8 @@ pub async fn run_plain(
     max_jobs: usize,
     timeout_secs: u64,
     no_worktrees: bool,
+    profiling: bool,
+    profile_out: Option<&Path>,
 ) -> Result<i32> {
     let cwd_name = cwd
         .file_name()
@@ -57,6 +59,8 @@ pub async fn run_plain(
         branch: String,
         output: String,
         state: &'static str,
+        elapsed: std::time::Duration,
+        last_log: String,
     }
 
     let semaphore = Arc::new(Semaphore::new(max_jobs));
@@ -84,6 +88,8 @@ pub async fn run_plain(
 
             let _permit = semaphore.acquire_owned().await.unwrap();
 
+            let started = std::time::Instant::now();
+
             let branch = get_branch(&path).await.unwrap_or_else(|_| "?".to_string());
 
             // Check dirty
@@ -96,6 +102,8 @@ pub async fn run_plain(
                     branch,
                     output,
                     state: "skipped",
+                    elapsed: std::time::Duration::ZERO,
+                    last_log: "uncommitted changes".to_string(),
                 });
                 return;
             }
@@ -117,6 +125,8 @@ pub async fn run_plain(
                         branch,
                         output,
                         state: "failed",
+                        elapsed: started.elapsed(),
+                        last_log: err.to_string(),
                     });
                     return;
                 }
@@ -156,6 +166,14 @@ pub async fn run_plain(
 
             let outcome = classify_pull_output(&combined, exit_success);
 
+            let last_log = combined
+                .lines()
+                .rev()
+                .map(|line| line.trim())
+                .find(|line| !line.is_empty())
+                .unwrap_or("")
+                .to_string();
+
             let (output, state) = match outcome {
                 PullOutcome::AlreadyUpToDate => {
                     (format!("✅ {name}\n"), "uptodate")
@@ -185,6 +203,8 @@ pub async fn run_plain(
                 branch,
                 output,
                 state,
+                elapsed: started.elapsed(),
+                last_log,
             });
         });
 
@@ -278,6 +298,35 @@ pub async fn run_plain(
 
     // Flush stdout
     io::stdout().flush()?;
+
+    if profiling {
+        let rows: Vec<crate::profile::ProfileRow> = results
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|result| {
+                let status = match result.state {
+                    "updated" => "updated",
+                    "uptodate" => "uptodate",
+                    "skipped" => "skipped",
+                    _ => "failed",
+                };
+                crate::profile::ProfileRow {
+                    name: result.name.clone(),
+                    branch: result.branch.clone(),
+                    status,
+                    elapsed: result.elapsed,
+                    last_log_line: result.last_log.clone(),
+                }
+            })
+            .collect();
+        let report = crate::profile::format_report(rows);
+        match profile_out {
+            Some(path) => std::fs::write(path, report)?,
+            None => eprint!("{report}"),
+        }
+    }
 
     if !failed.is_empty() {
         Ok(1)

@@ -17,8 +17,11 @@ pub async fn pull_repo(
 ) -> Result<()> {
     let _permit = semaphore.acquire_owned().await?;
 
+    let started = std::time::Instant::now();
     let (path, name) = {
-        let state = repo_state.lock().unwrap();
+        let mut state = repo_state.lock().unwrap();
+        state.start = Some(started);
+        state.elapsed = None;
         (state.path.clone(), state.name.clone())
     };
 
@@ -33,6 +36,7 @@ pub async fn pull_repo(
     let dirty = is_dirty(&path).await.unwrap_or(false);
     if dirty {
         let mut state = repo_state.lock().unwrap();
+        state.elapsed = Some(std::time::Duration::ZERO);
         state.status = RepoStatus::Skipped;
         state
             .log
@@ -102,9 +106,11 @@ pub async fn pull_repo(
 
     let outcome = classify_pull_output(&combined, exit_success);
 
+    let elapsed = started.elapsed();
     match outcome {
         PullOutcome::AlreadyUpToDate => {
             let mut state = repo_state.lock().unwrap();
+            state.elapsed = Some(elapsed);
             state.status = RepoStatus::UpToDate;
         }
         PullOutcome::Updated => {
@@ -117,10 +123,12 @@ pub async fn pull_repo(
                 }
             }
             let mut state = repo_state.lock().unwrap();
+            state.elapsed = Some(started.elapsed());
             state.status = RepoStatus::Updated;
         }
         PullOutcome::Failed => {
             let mut state = repo_state.lock().unwrap();
+            state.elapsed = Some(elapsed);
             state.status = RepoStatus::Failed;
         }
     }

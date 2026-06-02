@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum lines in the per-repo ring buffer.
 pub const RING_BUFFER_CAPACITY: usize = 10_000;
@@ -67,6 +67,10 @@ pub struct RepoState {
     pub auto_scroll: bool,
     /// Preview pane scroll offset (lines from top).
     pub preview_scroll: usize,
+    /// When this repo's pull began (after acquiring the concurrency permit).
+    pub start: Option<Instant>,
+    /// Wall-clock time spent on this repo, set when a terminal status is assigned.
+    pub elapsed: Option<Duration>,
 }
 
 impl RepoState {
@@ -79,6 +83,8 @@ impl RepoState {
             log: LogBuffer::default(),
             auto_scroll: true,
             preview_scroll: 0,
+            start: None,
+            elapsed: None,
         }
     }
 }

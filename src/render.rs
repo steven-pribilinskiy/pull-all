@@ -207,8 +207,15 @@ fn render_preview(frame: &mut Frame, app: &AppState, area: Rect, _tick: u64) {
                 RepoStatus::Running { pid } => format!("pid {pid}"),
                 _ => "pid —".to_string(),
             };
+            let elapsed_str = match state.elapsed {
+                Some(elapsed) => format!(" · {:.2}s", elapsed.as_secs_f64()),
+                None => match state.start {
+                    Some(start) => format!(" · {:.2}s", start.elapsed().as_secs_f64()),
+                    None => String::new(),
+                },
+            };
             let header = format!(
-                " {} · {} · {} ",
+                " {} · {} · {}{} ",
                 state.name,
                 match &state.status {
                     RepoStatus::Queued => "queued",
@@ -218,7 +225,8 @@ fn render_preview(frame: &mut Frame, app: &AppState, area: Rect, _tick: u64) {
                     RepoStatus::Skipped => "skipped",
                     RepoStatus::Failed => "failed",
                 },
-                pid_str
+                pid_str,
+                elapsed_str
             );
             let lines: Vec<String> = state.log.lines().iter().cloned().collect();
             let scroll = state.preview_scroll;
