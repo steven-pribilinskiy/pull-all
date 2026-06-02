@@ -50,6 +50,8 @@ bin/pull-all-tui --no-worktrees [DIR]
 | `k` / `↑` | Previous repo |
 | `g` | Jump to top |
 | `G` | Jump to bottom (Result item) |
+| `Space` | Toggle the Result summary in the preview without moving selection (any navigation clears it) |
+| `[` / `]` | Narrow / widen the left pane |
 | `Tab` | Toggle focus: list ↔ preview |
 | `PgUp` / `PgDn` | Scroll preview (when focused) |
 | `End` | Resume auto-scroll in preview |
@@ -60,6 +62,14 @@ bin/pull-all-tui --no-worktrees [DIR]
 | `Esc` | Clear filter (or quit when no filter) |
 | `q` | Quit |
 | `Ctrl-C` | Quit (exit 130) |
+
+### Mouse
+
+Click a repo row to select it, scroll the wheel over the left pane to move the
+selection or over the right pane to scroll the preview, and drag the divider
+between the panes to resize. While the TUI is running it captures the mouse, so
+native terminal text-selection is suspended until you quit (same tradeoff as
+lazygit/htop).
 
 ## Testing
 

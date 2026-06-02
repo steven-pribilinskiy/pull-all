@@ -44,29 +44,38 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 }
 
 /// Render a single frame into `frame`.
-pub fn render(frame: &mut Frame, app: &AppState, tick: u64) {
+pub fn render(frame: &mut Frame, app: &mut AppState, tick: u64) {
     let area = frame.area();
 
-    // Layout: main area + status bar at bottom
+    // Layout: main area + two-line status bar at bottom
     let vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(area);
 
     let main_area = vertical_chunks[0];
     let status_bar_area = vertical_chunks[1];
 
-    // Split main area horizontally: left list pane + right preview pane
+    // Split main area horizontally using the adjustable ratio.
+    let left_width = ((f64::from(main_area.width)) * app.split_ratio).round() as u16;
+    let left_width = left_width.clamp(1, main_area.width.saturating_sub(1).max(1));
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Length(left_width), Constraint::Min(0)])
         .split(main_area);
 
     let list_area = horizontal_chunks[0];
     let preview_area = horizontal_chunks[1];
 
-    // Render left pane
-    render_list(frame, app, list_area, tick);
+    // Capture geometry for mouse hit-testing in the event loop.
+    app.main_area = main_area;
+    app.list_area = list_area;
+    app.preview_area = preview_area;
+    app.divider_col = preview_area.x;
+
+    // Render left pane (returns the list's scroll offset for hit-testing).
+    let list_offset = render_list(frame, app, list_area, tick);
+    app.list_offset = list_offset;
 
     // Render right pane
     render_preview(frame, app, preview_area, tick);
@@ -75,7 +84,7 @@ pub fn render(frame: &mut Frame, app: &AppState, tick: u64) {
     render_status_bar(frame, app, status_bar_area);
 }
 
-fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) {
+fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) -> usize {
     let visible = app.visible_indices();
     let total_repos = app.repos.len();
     let elapsed = app.start.elapsed().as_secs_f64();
@@ -194,13 +203,18 @@ fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) {
         .highlight_symbol("→ ");
 
     frame.render_stateful_widget(list, inner, &mut list_state);
+
+    list_state.offset()
 }
 
 fn render_preview(frame: &mut Frame, app: &AppState, area: Rect, _tick: u64) {
     let visible = app.visible_indices();
 
+    // When the Result overlay is active, show the summary regardless of selection.
+    let show_result = app.result_overlay || app.selected >= visible.len();
+
     let (header_text, log_lines, scroll_offset, _auto_scroll) =
-        if app.selected < visible.len() {
+        if !show_result {
             let repo_idx = visible[app.selected];
             let state = app.repos[repo_idx].lock().unwrap();
             let pid_str = match &state.status {
@@ -456,25 +470,26 @@ fn render_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     let total = app.repos.len();
     let elapsed = app.start.elapsed().as_secs_f64();
 
-    let filter_hint = if app.filter_input_mode {
-        format!(
-            " Filter: {} │",
-            app.filter.as_deref().unwrap_or("")
-        )
-    } else if app.filter.is_some() {
-        format!(
-            " [{}] │",
-            app.filter.as_deref().unwrap_or("")
-        )
+    // Row 1 — move & view (or the live filter prompt when filtering).
+    let row1 = if app.filter_input_mode {
+        format!("Filter: {}", app.filter.as_deref().unwrap_or(""))
     } else {
-        String::new()
+        let filter_tag = match &app.filter {
+            Some(filter) if !filter.is_empty() => format!("[{filter}] "),
+            _ => String::new(),
+        };
+        format!(
+            "{filter_tag}j/k ↑/↓ move · g/G top/end · click select · wheel scroll · space result"
+        )
     };
 
-    let text = format!(
-        "{filter_hint} j/k nav · r retry · R retry-failed · / filter · q quit · {} jobs · {done}/{total} done · {running} running · {elapsed:.1}s",
+    // Row 2 — act & layout, plus live run stats.
+    let row2 = format!(
+        "r/R retry · / filter · [ ] / drag resize · tab focus · q quit  ·  {} jobs · {done}/{total} done · {running} running · {elapsed:.1}s",
         app.max_jobs
     );
 
+    let text = Text::from(vec![Line::from(row1), Line::from(row2)]);
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(para, area);
 }

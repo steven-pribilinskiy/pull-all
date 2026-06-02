@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ratatui::layout::Rect;
+
 /// Maximum lines in the per-repo ring buffer.
 pub const RING_BUFFER_CAPACITY: usize = 10_000;
 
@@ -122,6 +124,20 @@ pub struct AppState {
     pub all_done: bool,
     /// Number of jobs configured.
     pub max_jobs: usize,
+    /// Left-pane width as a fraction of the main area (clamped MIN_SPLIT..MAX_SPLIT).
+    pub split_ratio: f64,
+    /// When true, the preview shows the Result summary regardless of selection.
+    pub result_overlay: bool,
+    /// Main content area (above the status bar) — captured each render for hit-testing.
+    pub main_area: Rect,
+    /// Left list pane rect — captured each render for hit-testing.
+    pub list_area: Rect,
+    /// Right preview pane rect — captured each render for hit-testing.
+    pub preview_area: Rect,
+    /// Column of the divider between the panes (= preview_area.x).
+    pub divider_col: u16,
+    /// Scroll offset of the list widget, read back after render for row hit-testing.
+    pub list_offset: usize,
 }
 
 impl AppState {
@@ -138,6 +154,56 @@ impl AppState {
             start: Instant::now(),
             all_done: false,
             max_jobs,
+            split_ratio: Self::DEFAULT_SPLIT,
+            result_overlay: false,
+            main_area: Rect::default(),
+            list_area: Rect::default(),
+            preview_area: Rect::default(),
+            divider_col: 0,
+            list_offset: 0,
+        }
+    }
+
+    pub const DEFAULT_SPLIT: f64 = 0.4;
+    pub const MIN_SPLIT: f64 = 0.2;
+    pub const MAX_SPLIT: f64 = 0.7;
+
+    /// Nudge the split ratio by `delta`, clamped to the allowed range.
+    pub fn adjust_split(&mut self, delta: f64) {
+        self.split_ratio = (self.split_ratio + delta).clamp(Self::MIN_SPLIT, Self::MAX_SPLIT);
+    }
+
+    /// Set the split ratio from an absolute divider column (mouse drag).
+    pub fn set_split_from_col(&mut self, col: u16) {
+        if self.main_area.width == 0 {
+            return;
+        }
+        let rel = f64::from(col.saturating_sub(self.main_area.x)) / f64::from(self.main_area.width);
+        self.split_ratio = rel.clamp(Self::MIN_SPLIT, Self::MAX_SPLIT);
+    }
+
+    /// Map mouse coordinates to a list selection index, or None for the
+    /// separator row / outside the list. Result maps to `visible_len`.
+    pub fn list_selection_at(&self, col: u16, row: u16) -> Option<usize> {
+        let area = self.list_area;
+        if area.width < 2 || area.height < 2 {
+            return None;
+        }
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_right = inner_x + (area.width - 2);
+        let inner_bottom = inner_y + (area.height - 2);
+        if col < inner_x || col >= inner_right || row < inner_y || row >= inner_bottom {
+            return None;
+        }
+        let row_idx = (row - inner_y) as usize + self.list_offset;
+        let visible_len = self.visible_indices().len();
+        if row_idx < visible_len {
+            Some(row_idx)
+        } else if row_idx == visible_len + 1 {
+            Some(visible_len)
+        } else {
+            None
         }
     }
 
@@ -204,6 +270,7 @@ impl AppState {
     /// Navigate selection up, returns true if changed.
     pub fn nav_up(&mut self) -> bool {
         self.user_navigated = true;
+        self.result_overlay = false;
         if self.selected > 0 {
             self.selected -= 1;
             true
@@ -215,6 +282,7 @@ impl AppState {
     /// Navigate selection down, returns true if changed.
     pub fn nav_down(&mut self) -> bool {
         self.user_navigated = true;
+        self.result_overlay = false;
         let max = self.list_len().saturating_sub(1);
         if self.selected < max {
             self.selected += 1;
@@ -226,11 +294,13 @@ impl AppState {
 
     pub fn nav_top(&mut self) {
         self.user_navigated = true;
+        self.result_overlay = false;
         self.selected = 0;
     }
 
     pub fn nav_bottom(&mut self) {
         self.user_navigated = true;
+        self.result_overlay = false;
         self.selected = self.list_len().saturating_sub(1);
     }
 

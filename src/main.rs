@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -138,7 +141,7 @@ async fn run_tui(
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -146,7 +149,7 @@ async fn run_tui(
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         original_hook(panic_info);
     }));
 
@@ -169,7 +172,7 @@ async fn run_tui(
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     // Emit the profile report only after the alternate screen is left so it
@@ -236,6 +239,9 @@ async fn run_event_loop(
     // Track which repos to retry
     let mut retry_queue: Vec<usize> = Vec::new();
 
+    // Whether the divider is currently being dragged with the mouse.
+    let mut dragging_divider = false;
+
     loop {
         // Update "all done" state and auto-select Result when complete
         {
@@ -297,14 +303,65 @@ async fn run_event_loop(
 
         // Render
         {
-            let app = app_state.lock().unwrap();
-            terminal.draw(|frame| render::render(frame, &app, tick))?;
+            let mut app = app_state.lock().unwrap();
+            terminal.draw(|frame| render::render(frame, &mut app, tick))?;
         }
 
         // Handle events with a short timeout for animation
         let poll_timeout = Duration::from_millis(50);
         if event::poll(poll_timeout)? {
-            if let Event::Key(key) = event::read()? {
+            match event::read()? {
+            Event::Mouse(mouse) => {
+                let mut app = app_state.lock().unwrap();
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let on_divider = (i32::from(mouse.column) - i32::from(app.divider_col))
+                            .abs()
+                            <= 1
+                            && mouse.row >= app.main_area.y
+                            && mouse.row < app.main_area.y + app.main_area.height;
+                        if on_divider {
+                            dragging_divider = true;
+                        } else if let Some(selection) =
+                            app.list_selection_at(mouse.column, mouse.row)
+                        {
+                            app.selected = selection;
+                            app.user_navigated = true;
+                            app.result_overlay = false;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if dragging_divider {
+                            app.set_split_from_col(mouse.column);
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        dragging_divider = false;
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if mouse.column < app.divider_col {
+                            app.nav_up();
+                        } else if let Some(repo_idx) = app.selected_repo_index() {
+                            let mut state = app.repos[repo_idx].lock().unwrap();
+                            state.auto_scroll = false;
+                            state.preview_scroll = state.preview_scroll.saturating_sub(3);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if mouse.column < app.divider_col {
+                            app.nav_down();
+                        } else if let Some(repo_idx) = app.selected_repo_index() {
+                            let total = app.repos[repo_idx].lock().unwrap().log.lines().len();
+                            let mut state = app.repos[repo_idx].lock().unwrap();
+                            state.auto_scroll = false;
+                            state.preview_scroll =
+                                (state.preview_scroll + 3).min(total.saturating_sub(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Key(key) => {
                 let mut app = app_state.lock().unwrap();
 
                 // Filter input mode
@@ -369,6 +426,19 @@ async fn run_event_loop(
                     // Tab: toggle focus between list and preview
                     (KeyCode::Tab, _) => {
                         app.preview_focused = !app.preview_focused;
+                    }
+
+                    // Space: toggle the Result preview overlay (temporary switch).
+                    (KeyCode::Char(' '), _) => {
+                        app.result_overlay = !app.result_overlay;
+                    }
+
+                    // Resize the split: [ narrows the left pane, ] widens it.
+                    (KeyCode::Char('['), _) => {
+                        app.adjust_split(-0.03);
+                    }
+                    (KeyCode::Char(']'), _) => {
+                        app.adjust_split(0.03);
                     }
 
                     // Filter
@@ -440,6 +510,8 @@ async fn run_event_loop(
 
                     _ => {}
                 }
+            }
+            _ => {}
             }
         }
 
