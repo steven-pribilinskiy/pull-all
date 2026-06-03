@@ -2,7 +2,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -82,6 +82,11 @@ pub fn render(frame: &mut Frame, app: &mut AppState, tick: u64) {
 
     // Render status bar
     render_status_bar(frame, app, status_bar_area);
+
+    // Help modal overlays everything else.
+    if app.show_help {
+        render_help(frame, app, area);
+    }
 }
 
 fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) -> usize {
@@ -479,7 +484,7 @@ fn render_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
             _ => String::new(),
         };
         format!(
-            "{filter_tag}j/k ↑/↓ move · g/G top/end · click select · wheel scroll · space result"
+            "{filter_tag}j/k ↑/↓ move · g/G top/end · click select · wheel scroll · space result · ? help"
         )
     };
 
@@ -514,4 +519,156 @@ fn render_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     let text = Text::from(vec![Line::from(row1), row2]);
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(para, area);
+}
+
+/// A centered rect of the given size within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Render the `?` help modal: clickable links, subcommands, flags/env, grouped hotkeys,
+/// exit codes, and the repo list (each row clickable to open its remote). Records the
+/// screen row of every clickable line into `app.help_links` for mouse hit-testing.
+fn render_help(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    const GITHUB_URL: &str = "https://github.com/steven-pribilinskiy/pull-all";
+    const NOTES_BAKEOFF: &str =
+        "https://notes.lvh.me/library/default/devtools/pull-all-tui-bake-off-2026.md";
+    const NOTES_FEATURES: &str =
+        "https://notes.lvh.me/library/default/devtools/pull-all-tui-interaction-features-2026.md";
+
+    let header_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(Color::Gray);
+    let link_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+    let dim_style = Style::default().fg(Color::DarkGray);
+
+    // Each item is a line plus an optional URL that makes the whole row clickable.
+    let mut items: Vec<(Line<'static>, Option<String>)> = Vec::new();
+    let header = |text: &str| (Line::from(Span::styled(text.to_string(), header_style)), None);
+    let plain = |text: &str| (Line::from(text.to_string()), None);
+    let link = |label: &str, url: &str| {
+        let line = Line::from(vec![
+            Span::styled(format!("{label:<9}"), label_style),
+            Span::styled(url.to_string(), link_style),
+        ]);
+        (line, Some(url.to_string()))
+    };
+
+    items.push((
+        Line::from(Span::styled(
+            "pull-all — interactive multi-repo git pull dashboard".to_string(),
+            header_style,
+        )),
+        None,
+    ));
+    items.push(plain(""));
+    items.push(link("GitHub", GITHUB_URL));
+    items.push(link("Notes", NOTES_BAKEOFF));
+    items.push(link("", NOTES_FEATURES));
+    items.push(plain(""));
+
+    items.push(header("SUBCOMMANDS  (forward to sibling builds; args passed through)"));
+    items.push(plain("  pull-all go  [args]   Go / bubbletea build"));
+    items.push(plain("  pull-all bun [args]   Bun / ink build (JIT)"));
+    items.push(plain("  pull-all cli [args]   bash streaming version"));
+    items.push(plain(""));
+
+    items.push(header("FLAGS & ENVIRONMENT"));
+    items.push(plain("  [DIR]                          directory to scan (default: cwd)"));
+    items.push(plain("  -j N  / PULL_JOBS=N            concurrency (default: nproc)"));
+    items.push(plain("  --timeout S / PULL_TIMEOUT=S   per-pull timeout seconds (default: 30)"));
+    items.push(plain("  --no-tui                       plain streaming output (no TUI)"));
+    items.push(plain("  --no-worktrees                 skip worktree discovery"));
+    items.push(plain("  --profile / PULL_PROFILE=1     per-repo timing report (slowest first)"));
+    items.push(plain("  --profile-out FILE             write the profile report to FILE"));
+    items.push(plain(""));
+
+    items.push(header("HOTKEYS"));
+    items.push(plain("  Move     j/k  ↑/↓  ·  g/G top/end  ·  wheel scroll  ·  click a row to select"));
+    items.push(plain("  View     space result overlay  ·  tab list/preview focus  ·  PgUp/PgDn scroll preview  ·  End resume autoscroll"));
+    items.push(plain("  Retry    r selected · R all          (repos that failed or were skipped)"));
+    items.push(plain("  Refetch  f selected · F all          (re-pull anything; skips in-progress)"));
+    items.push(plain("  Layout   [ ] resize panes  ·  drag the divider to resize"));
+    items.push(plain("  Filter   / filter by name  ·  Esc clear filter"));
+    items.push(plain("  Other    c clear log  ·  ? this help  ·  q quit  ·  Ctrl-C exit"));
+    items.push(plain(""));
+
+    items.push(header("EXIT CODES"));
+    items.push(plain("  0 all ok  ·  1 any failed  ·  2 quit mid-run  ·  130 Ctrl-C"));
+    items.push(plain(""));
+
+    items.push(header("REPOSITORIES  (click a row to open it on its host)"));
+    let name_pad = app
+        .repos
+        .iter()
+        .map(|repo| repo.lock().unwrap().name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(30);
+    for repo in &app.repos {
+        let state = repo.lock().unwrap();
+        let name = state.name.clone();
+        let branch = state.branch.clone().unwrap_or_else(|| "?".to_string());
+        let prefix = Span::styled(format!("  {name:<name_pad$}  "), label_style);
+        let branch_span = Span::styled(format!("{branch:<16}"), Style::default().fg(Color::Cyan));
+        match &state.remote_url {
+            Some(url) => {
+                let line = Line::from(vec![
+                    prefix,
+                    branch_span,
+                    Span::styled(url.clone(), link_style),
+                ]);
+                items.push((line, Some(url.clone())));
+            }
+            None => {
+                let line = Line::from(vec![
+                    prefix,
+                    branch_span,
+                    Span::styled("(no remote)".to_string(), dim_style),
+                ]);
+                items.push((line, None));
+            }
+        }
+    }
+
+    let modal_width = area.width.saturating_sub(4).min(110).max(40);
+    let modal_height = area.height.saturating_sub(2).max(8);
+    let modal_area = centered_rect(modal_width, modal_height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" pull-all — help ")
+        .title_bottom(Line::from(" ↑/↓ scroll · click a link · ?/Esc close ").right_aligned());
+    let inner = block.inner(modal_area);
+
+    // Clamp scroll to the content, then window the visible slice.
+    let inner_height = inner.height as usize;
+    let max_scroll = items.len().saturating_sub(inner_height);
+    if app.help_scroll > max_scroll {
+        app.help_scroll = max_scroll;
+    }
+    let start = app.help_scroll;
+    let end = (start + inner_height).min(items.len());
+
+    app.help_links.clear();
+    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, (line, url)) in items[start..end].iter().enumerate() {
+        if let Some(url) = url {
+            app.help_links.push((inner.y + offset as u16, url.clone()));
+        }
+        lines.push(line.clone());
+    }
+
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(block, modal_area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }

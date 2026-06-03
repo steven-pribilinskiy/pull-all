@@ -26,7 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::{AppState, RepoState, RepoStatus, SharedRepoState};
-use worker::{run_all_pulls, run_worktree_discovery};
+use worker::{run_all_pulls, run_remote_url_discovery, run_worktree_discovery};
 
 /// Interactive multi-repo git pull dashboard.
 #[derive(Parser, Debug)]
@@ -97,6 +97,29 @@ fn maybe_dispatch_sibling() {
     let error = Command::new(target).args(&rest).exec();
     eprintln!("error: failed to launch `{target}`: {error}");
     std::process::exit(127);
+}
+
+/// Open a URL in the user's browser via the first available opener, detached.
+fn open_url(url: &str) {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(browser) = std::env::var("BROWSER") {
+        if !browser.is_empty() {
+            candidates.push(browser);
+        }
+    }
+    candidates.extend(["wslview", "xdg-open", "open"].map(String::from));
+
+    for opener in candidates {
+        let spawned = Command::new(&opener)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return;
+        }
+    }
 }
 
 async fn run() -> Result<i32> {
@@ -189,6 +212,12 @@ async fn run_tui(
     let repos_clone = repos.clone();
     tokio::spawn(async move {
         let _ = run_all_pulls(repos_clone, max_jobs, timeout_secs).await;
+    });
+
+    // Discover origin remote URLs in the background for the help modal's clickable links.
+    let repos_for_urls = repos.clone();
+    tokio::spawn(async move {
+        run_remote_url_discovery(repos_for_urls, max_jobs).await;
     });
 
     // Spawn worktree discovery
@@ -345,6 +374,27 @@ async fn run_event_loop(
             match event::read()? {
             Event::Mouse(mouse) => {
                 let mut app = app_state.lock().unwrap();
+
+                // Help modal: a click opens the link under the cursor; the wheel scrolls.
+                if app.show_help {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(url) = app.help_link_at(mouse.row) {
+                                drop(app);
+                                open_url(&url);
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            app.help_scroll = app.help_scroll.saturating_add(3);
+                        }
+                        MouseEventKind::ScrollUp => {
+                            app.help_scroll = app.help_scroll.saturating_sub(3);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let on_divider = (i32::from(mouse.column) - i32::from(app.divider_col))
@@ -424,6 +474,37 @@ async fn run_event_loop(
                     continue;
                 }
 
+                // Help modal: swallow keys while open (scroll or close).
+                if app.show_help {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        drop(app);
+                        return Ok(130);
+                    }
+                    match key.code {
+                        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                            app.show_help = false;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            app.help_scroll = app.help_scroll.saturating_add(1);
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.help_scroll = app.help_scroll.saturating_sub(1);
+                        }
+                        KeyCode::PageDown => {
+                            app.help_scroll = app.help_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp => {
+                            app.help_scroll = app.help_scroll.saturating_sub(10);
+                        }
+                        KeyCode::Char('g') => app.help_scroll = 0,
+                        KeyCode::Char('G') => app.help_scroll = usize::MAX,
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Normal key handling
                 match (key.code, key.modifiers) {
                     // Quit
@@ -463,6 +544,12 @@ async fn run_event_loop(
                     // Space: toggle the Result preview overlay (temporary switch).
                     (KeyCode::Char(' '), _) => {
                         app.result_overlay = !app.result_overlay;
+                    }
+
+                    // Help modal
+                    (KeyCode::Char('?'), _) => {
+                        app.show_help = true;
+                        app.help_scroll = 0;
                     }
 
                     // Resize the split: [ narrows the left pane, ] widens it.

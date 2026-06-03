@@ -72,12 +72,17 @@ A directory literally named `go`/`bun`/`cli` is still reachable as `pull-all ./g
 | `f` | Refetch selected repo (re-pull regardless of status, unless it's in progress) |
 | `F` | Refetch all repos that aren't currently in progress |
 | `c` | Clear log buffer for selected repo |
+| `?` | Open the help modal (clickable repo/notes/GitHub links, all keys, flags & env) |
 | `/` | Filter repos by name |
 | `Esc` | Clear filter (or quit when no filter) |
 | `q` | Quit |
 | `Ctrl-C` | Quit (exit 130) |
 
 **Retry vs refetch:** retry only re-runs repos that need it (failed/skipped); refetch re-runs any repo even if it was already up to date. In the status bar, `r`/`R` dim when no repo has an issue, and `f`/`F` dim when there's nothing eligible (the selected repo is still in progress).
+
+### Help modal (`?`)
+
+`?` opens an in-app reference: links to this repo on GitHub and the design notes on `notes.lvh.me`, the `go`/`bun`/`cli` subcommands, every flag and environment variable, the hotkeys grouped by purpose, exit codes, and the full repo list — each repo row and link is clickable (opens in your browser via `$BROWSER`/`wslview`/`xdg-open`). Scroll with `j`/`k`, `g`/`G`, `PgUp`/`PgDn`, or the wheel; close with `?`/`Esc`/`q`.
 
 ### Mouse
 

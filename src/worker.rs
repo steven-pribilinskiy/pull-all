@@ -6,7 +6,10 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::app::{AppState, RepoStatus, SharedRepoState, WorktreeEntry};
-use crate::git::{classify_pull_output, diff_stat, discover_worktrees, get_branch, is_dirty, PullOutcome};
+use crate::git::{
+    classify_pull_output, diff_stat, discover_worktrees, get_branch, get_remote_url, is_dirty,
+    PullOutcome,
+};
 
 /// Pull a single repository, updating `repo_state` as progress arrives.
 /// Signals completion via the state's status field.
@@ -173,5 +176,28 @@ pub async fn run_all_pulls(
     }
 
     Ok(())
+}
+
+/// Fetch each repo's `origin` remote URL concurrently and store it on the repo state,
+/// so the help modal can offer clickable links. Best-effort: failures leave `remote_url` None.
+pub async fn run_remote_url_discovery(repos: Vec<SharedRepoState>, max_jobs: usize) {
+    let semaphore = Arc::new(Semaphore::new(max_jobs.max(1)));
+    let mut handles = Vec::new();
+
+    for repo_state in repos {
+        let semaphore = Arc::clone(&semaphore);
+        let handle = tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let path = { repo_state.lock().unwrap().path.clone() };
+            if let Some(url) = get_remote_url(&path).await {
+                repo_state.lock().unwrap().remote_url = Some(url);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
 }
 

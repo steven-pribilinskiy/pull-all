@@ -67,6 +67,8 @@ pub struct RepoState {
     pub name: String,
     pub path: PathBuf,
     pub branch: Option<String>,
+    /// Browsable https URL of the `origin` remote, discovered asynchronously.
+    pub remote_url: Option<String>,
     pub status: RepoStatus,
     /// Log ring buffer (stdout + stderr from git pull).
     pub log: LogBuffer,
@@ -86,6 +88,7 @@ impl RepoState {
             name: name.into(),
             path,
             branch: None,
+            remote_url: None,
             status: RepoStatus::Queued,
             log: LogBuffer::default(),
             auto_scroll: true,
@@ -143,6 +146,12 @@ pub struct AppState {
     pub divider_col: u16,
     /// Scroll offset of the list widget, read back after render for row hit-testing.
     pub list_offset: usize,
+    /// Whether the help modal (`?`) is open.
+    pub show_help: bool,
+    /// Scroll offset within the help modal.
+    pub help_scroll: usize,
+    /// Clickable links in the help modal: (absolute screen row, url). Rebuilt each render.
+    pub help_links: Vec<(u16, String)>,
 }
 
 impl AppState {
@@ -166,7 +175,18 @@ impl AppState {
             preview_area: Rect::default(),
             divider_col: 0,
             list_offset: 0,
+            show_help: false,
+            help_scroll: 0,
+            help_links: Vec::new(),
         }
+    }
+
+    /// The URL of a clickable help-modal link at the given screen row, if any.
+    pub fn help_link_at(&self, row: u16) -> Option<String> {
+        self.help_links
+            .iter()
+            .find(|(link_row, _)| *link_row == row)
+            .map(|(_, url)| url.clone())
     }
 
     pub const DEFAULT_SPLIT: f64 = 0.4;

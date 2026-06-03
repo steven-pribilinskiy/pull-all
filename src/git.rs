@@ -126,6 +126,43 @@ pub async fn discover_repos(cwd: &Path) -> Result<Vec<PathBuf>> {
     Ok(repos)
 }
 
+/// Get the `origin` remote URL for a repo, normalized to a browsable https URL.
+/// Returns None when there's no origin or the URL isn't a recognized git host form.
+pub async fn get_remote_url(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", dir.to_str().unwrap_or("."), "remote", "get-url", "origin"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    normalize_remote_url(&raw)
+}
+
+/// Convert a git remote URL (scp-like, ssh, or http(s)) into a browsable https URL.
+/// `git@github.com:org/repo.git` and `ssh://git@github.com/org/repo.git` both become
+/// `https://github.com/org/repo`. Returns None for local paths or unknown forms.
+pub fn normalize_remote_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let https = if let Some(rest) = raw.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("https://{host}/{path}")
+    } else if let Some(rest) = raw.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        format!("https://{rest}")
+    } else if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        return None;
+    };
+    Some(https.strip_suffix(".git").unwrap_or(&https).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +230,27 @@ mod tests {
                 "classify_pull_output({output:?}, {exit_success}) should be {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_remote_url_handles_all_forms() {
+        assert_eq!(
+            normalize_remote_url("git@github.com:org/repo.git").as_deref(),
+            Some("https://github.com/org/repo")
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/org/repo.git").as_deref(),
+            Some("https://github.com/org/repo")
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/org/repo").as_deref(),
+            Some("https://github.com/org/repo")
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/org/repo.git").as_deref(),
+            Some("https://github.com/org/repo")
+        );
+        assert_eq!(normalize_remote_url(""), None);
+        assert_eq!(normalize_remote_url("/local/path/repo"), None);
     }
 }
