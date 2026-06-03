@@ -91,7 +91,7 @@ fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) -> usiz
 
     let done = app.done_count();
     let title = format!(
-        " pull-all-tui · {done}/{total_repos} · {elapsed:.1}s "
+        " pull-all · {done}/{total_repos} · {elapsed:.1}s "
     );
 
     let block = Block::default()
@@ -483,13 +483,35 @@ fn render_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
         )
     };
 
-    // Row 2 — act & layout, plus live run stats.
-    let row2 = format!(
-        "r/R retry · / filter · [ ] / drag resize · tab focus · q quit  ·  {} jobs · {done}/{total} done · {running} running · {elapsed:.1}s",
+    // Row 2 — act & layout, plus live run stats. Action letters dim when they're a no-op:
+    // r/R (retry) need a failed/skipped repo; f/F (refetch) need a repo that isn't in progress.
+    let hint = Style::default().fg(Color::DarkGray);
+    let active = Style::default().fg(Color::Gray);
+    let dimmed = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+
+    let style_retry_one = if app.selected_repo_retryable() { active } else { dimmed };
+    let style_retry_all = if app.any_retryable() { active } else { dimmed };
+    let style_refetch_one = if app.selected_repo_refetchable() { active } else { dimmed };
+    let style_refetch_all = if app.any_refetchable() { active } else { dimmed };
+
+    let stats = format!(
+        "  ·  {} jobs · {done}/{total} done · {running} running · {elapsed:.1}s",
         app.max_jobs
     );
 
-    let text = Text::from(vec![Line::from(row1), Line::from(row2)]);
+    let row2 = Line::from(vec![
+        Span::styled("r", style_retry_one),
+        Span::styled("/", hint),
+        Span::styled("R", style_retry_all),
+        Span::styled(" retry · ", hint),
+        Span::styled("f", style_refetch_one),
+        Span::styled("/", hint),
+        Span::styled("F", style_refetch_all),
+        Span::styled(" refetch · / filter · [ ] / drag resize · tab focus · q quit", hint),
+        Span::styled(stats, hint),
+    ]);
+
+    let text = Text::from(vec![Line::from(row1), row2]);
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(para, area);
 }

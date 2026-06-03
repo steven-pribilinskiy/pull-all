@@ -28,7 +28,7 @@ pub fn format_report(mut rows: Vec<ProfileRow>) -> String {
     let name_pad = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
 
     let mut out = format!(
-        "pull-all-tui profile — {} repos, slowest first\n",
+        "pull-all profile — {} repos, slowest first\n",
         rows.len()
     );
     for row in &rows {

@@ -1,10 +1,10 @@
 [package]
-name = "pull-all-tui"
-version = "0.1.0"
+name = "pull-all"
+version = "0.2.0"
 edition = "2024"
 
 [[bin]]
-name = "pull-all-tui"
+name = "pull-all"
 path = "src/main.rs"
 
 [dependencies]

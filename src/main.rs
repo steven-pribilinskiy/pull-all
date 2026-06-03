@@ -6,7 +6,9 @@ mod render;
 mod worker;
 
 use std::io::{self, IsTerminal};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +30,16 @@ use worker::{run_all_pulls, run_worktree_discovery};
 
 /// Interactive multi-repo git pull dashboard.
 #[derive(Parser, Debug)]
-#[command(name = "pull-all-tui", version, about)]
+#[command(
+    name = "pull-all",
+    version,
+    about,
+    after_help = "Sibling implementations (forwarded verbatim):\n  \
+        pull-all go  [args]   Go / bubbletea build\n  \
+        pull-all bun [args]   Bun / ink build (JIT)\n  \
+        pull-all cli [args]   bash streaming version\n\n\
+        A directory literally named go/bun/cli is still reachable as ./go etc."
+)]
 struct Cli {
     /// Directory to pull repos from (default: cwd)
     dir: Option<PathBuf>,
@@ -60,11 +71,32 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    maybe_dispatch_sibling();
     let exit_code = run().await.unwrap_or_else(|err| {
         eprintln!("error: {err:#}");
         1
     });
     std::process::exit(exit_code);
+}
+
+/// If invoked as `pull-all go|bun|cli [args]`, replace this process with the matching
+/// sibling implementation (resolved on `$PATH`) and forward the remaining args. Returns
+/// for every other invocation so the default Rust TUI runs.
+fn maybe_dispatch_sibling() {
+    let mut args = std::env::args().skip(1);
+    let Some(subcommand) = args.next() else {
+        return;
+    };
+    let target = match subcommand.as_str() {
+        "go" => "pull-all-tui-go",
+        "bun" => "pull-all-tui-bun-jit",
+        "cli" => "pull-all-repos",
+        _ => return,
+    };
+    let rest: Vec<String> = args.collect();
+    let error = Command::new(target).args(&rest).exec();
+    eprintln!("error: failed to launch `{target}`: {error}");
+    std::process::exit(127);
 }
 
 async fn run() -> Result<i32> {
@@ -484,28 +516,43 @@ async fn run_event_loop(
                         }
                     }
 
-                    // Retry selected failed repo
+                    // Retry selected repo if it has an issue (failed or skipped).
                     (KeyCode::Char('r'), _) | (KeyCode::Enter, _) => {
-                        if app.all_done {
-                            if let Some(repo_idx) = app.selected_repo_index() {
-                                let is_failed = {
-                                    let state = app.repos[repo_idx].lock().unwrap();
-                                    state.status.is_failed()
-                                };
-                                if is_failed {
-                                    drop(app);
-                                    retry_queue.push(repo_idx);
-                                }
+                        if let Some(repo_idx) = app.selected_repo_index() {
+                            let retryable = {
+                                let state = app.repos[repo_idx].lock().unwrap();
+                                state.status.is_retryable()
+                            };
+                            if retryable {
+                                drop(app);
+                                retry_queue.push(repo_idx);
                             }
                         }
                     }
-                    // Retry all failed repos
+                    // Retry all repos with an issue (failed or skipped).
                     (KeyCode::Char('R'), _) => {
-                        if app.all_done {
-                            let failed = app.failed_repos();
-                            drop(app);
-                            retry_queue.extend(failed);
+                        let retryable = app.retryable_repos();
+                        drop(app);
+                        retry_queue.extend(retryable);
+                    }
+                    // Refetch selected repo: re-run regardless of status, unless it's in progress.
+                    (KeyCode::Char('f'), _) => {
+                        if let Some(repo_idx) = app.selected_repo_index() {
+                            let refetchable = {
+                                let state = app.repos[repo_idx].lock().unwrap();
+                                state.status.is_terminal()
+                            };
+                            if refetchable {
+                                drop(app);
+                                retry_queue.push(repo_idx);
+                            }
                         }
+                    }
+                    // Refetch all repos not currently in progress.
+                    (KeyCode::Char('F'), _) => {
+                        let refetchable = app.refetchable_repos();
+                        drop(app);
+                        retry_queue.extend(refetchable);
                     }
 
                     _ => {}

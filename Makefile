@@ -1,16 +1,19 @@
-.PHONY: build test bench clean
+.PHONY: build install test bench clean
 
 build:
 	cargo build --release
-	cp target/release/pull-all-tui bin/pull-all-tui
+	cp target/release/pull-all bin/pull-all
+
+install: build
+	cp target/release/pull-all $(HOME)/bin/pull-all
 
 test:
 	cargo test
 
 bench:
 	@echo "Running benchmark on current directory (use --timeout 5 for quick mode)..."
-	time bin/pull-all-tui --no-tui 2>&1
+	time bin/pull-all --no-tui 2>&1
 
 clean:
 	cargo clean
-	rm -f bin/pull-all-tui
+	rm -f bin/pull-all

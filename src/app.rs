@@ -32,6 +32,11 @@ impl RepoStatus {
     pub fn is_failed(&self) -> bool {
         matches!(self, RepoStatus::Failed)
     }
+
+    /// A repo "has an issue" worth retrying: it failed, or was skipped (dirty).
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, RepoStatus::Failed | RepoStatus::Skipped)
+    }
 }
 
 /// Ring buffer capped at `RING_BUFFER_CAPACITY` lines.
@@ -258,13 +263,53 @@ impl AppState {
         updated + up_to_date + skipped + failed
     }
 
-    pub fn failed_repos(&self) -> Vec<usize> {
+    /// Repos with an issue (failed or skipped) — the targets of "retry".
+    pub fn retryable_repos(&self) -> Vec<usize> {
         self.repos
             .iter()
             .enumerate()
-            .filter(|(_, repo)| repo.lock().unwrap().status.is_failed())
+            .filter(|(_, repo)| repo.lock().unwrap().status.is_retryable())
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// Repos not currently in progress — the targets of "refetch" (re-run regardless of status).
+    pub fn refetchable_repos(&self) -> Vec<usize> {
+        self.repos
+            .iter()
+            .enumerate()
+            .filter(|(_, repo)| repo.lock().unwrap().status.is_terminal())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selected_status_matches(&self, predicate: impl Fn(&RepoStatus) -> bool) -> bool {
+        self.selected_repo_index()
+            .is_some_and(|index| predicate(&self.repos[index].lock().unwrap().status))
+    }
+
+    /// The selected repo has an issue (failed or skipped) — `r` is meaningful.
+    pub fn selected_repo_retryable(&self) -> bool {
+        self.selected_status_matches(RepoStatus::is_retryable)
+    }
+
+    /// The selected repo is done (not in progress) — `f` is meaningful.
+    pub fn selected_repo_refetchable(&self) -> bool {
+        self.selected_status_matches(RepoStatus::is_terminal)
+    }
+
+    /// Any repo has an issue — `R` is meaningful.
+    pub fn any_retryable(&self) -> bool {
+        self.repos
+            .iter()
+            .any(|repo| repo.lock().unwrap().status.is_retryable())
+    }
+
+    /// Any repo is done (not in progress) — `F` is meaningful.
+    pub fn any_refetchable(&self) -> bool {
+        self.repos
+            .iter()
+            .any(|repo| repo.lock().unwrap().status.is_terminal())
     }
 
     /// Navigate selection up, returns true if changed.
@@ -312,5 +357,97 @@ impl AppState {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(statuses: &[RepoStatus]) -> AppState {
+        let repos: Vec<SharedRepoState> = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| {
+                let mut repo = RepoState::new(format!("repo{index}"), PathBuf::from("/tmp"));
+                repo.status = status.clone();
+                Arc::new(Mutex::new(repo))
+            })
+            .collect();
+        AppState::new(repos, 4)
+    }
+
+    #[test]
+    fn is_retryable_covers_failed_and_skipped_only() {
+        assert!(RepoStatus::Failed.is_retryable());
+        assert!(RepoStatus::Skipped.is_retryable());
+        assert!(!RepoStatus::UpToDate.is_retryable());
+        assert!(!RepoStatus::Updated.is_retryable());
+        assert!(!RepoStatus::Queued.is_retryable());
+        assert!(!RepoStatus::Running { pid: 1 }.is_retryable());
+    }
+
+    #[test]
+    fn retry_targets_are_failed_and_skipped() {
+        let state = state_with(&[
+            RepoStatus::UpToDate,
+            RepoStatus::Failed,
+            RepoStatus::Skipped,
+            RepoStatus::Running { pid: 1 },
+        ]);
+        assert_eq!(state.retryable_repos(), vec![1, 2]);
+        assert!(state.any_retryable());
+    }
+
+    #[test]
+    fn refetch_targets_are_terminal_repos_only() {
+        let state = state_with(&[
+            RepoStatus::UpToDate,
+            RepoStatus::Failed,
+            RepoStatus::Skipped,
+            RepoStatus::Running { pid: 1 },
+            RepoStatus::Queued,
+        ]);
+        assert_eq!(state.refetchable_repos(), vec![0, 1, 2]);
+        assert!(state.any_refetchable());
+    }
+
+    #[test]
+    fn selected_helpers_track_the_current_row() {
+        let mut state = state_with(&[
+            RepoStatus::UpToDate,
+            RepoStatus::Failed,
+            RepoStatus::Skipped,
+            RepoStatus::Running { pid: 1 },
+        ]);
+
+        state.selected = 0; // clean success: refetchable but not retryable
+        assert!(!state.selected_repo_retryable());
+        assert!(state.selected_repo_refetchable());
+
+        state.selected = 1; // failed: both
+        assert!(state.selected_repo_retryable());
+        assert!(state.selected_repo_refetchable());
+
+        state.selected = 2; // skipped: both
+        assert!(state.selected_repo_retryable());
+        assert!(state.selected_repo_refetchable());
+
+        state.selected = 3; // running: neither
+        assert!(!state.selected_repo_retryable());
+        assert!(!state.selected_repo_refetchable());
+
+        state.selected = 4; // Result item (no repo)
+        assert!(!state.selected_repo_retryable());
+        assert!(!state.selected_repo_refetchable());
+    }
+
+    #[test]
+    fn all_clean_successes_have_no_retry_targets() {
+        let state = state_with(&[RepoStatus::UpToDate, RepoStatus::Updated]);
+        assert!(!state.any_retryable());
+        assert!(state.retryable_repos().is_empty());
+        assert!(state.any_refetchable());
+        assert_eq!(state.refetchable_repos(), vec![0, 1]);
     }
 }
