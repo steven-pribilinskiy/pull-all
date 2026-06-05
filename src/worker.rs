@@ -5,11 +5,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::app::{AppState, RepoPageData, RepoStatus, SharedRepoState, WorktreeEntry};
+use crate::app::{
+    AppState, PageRow, PageRowKind, RepoPageData, RepoStatus, SharedRepoState, WorktreeEntry,
+};
 use crate::git::{
     checkout_branch, classify_pull_output, delete_branch, diff_stat, discover_worktrees,
-    fetch_remote, get_branch, get_diff, get_remote_url, get_repo_details, is_dirty,
-    list_local_branches, list_worktrees, PullOutcome,
+    fetch_ff_branch, fetch_remote, get_branch, get_diff, get_remote_url, get_repo_details,
+    is_dirty, list_local_branches, list_worktrees, pull_all_branches, pull_ff_only, PullOutcome,
 };
 
 /// Pull a single repository, updating `repo_state` as progress arrives.
@@ -142,10 +144,7 @@ pub async fn pull_repo(
 
 /// Discover worktrees and update app_state when done.
 pub async fn run_worktree_discovery(app_state: Arc<Mutex<AppState>>, cwd: std::path::PathBuf) {
-    let entries = match discover_worktrees(&cwd).await {
-        Ok(entries) => entries,
-        Err(_) => Vec::new(),
-    };
+    let entries = discover_worktrees(&cwd).await.unwrap_or_default();
 
     let worktrees: Vec<WorktreeEntry> = entries
         .into_iter()
@@ -271,6 +270,72 @@ pub async fn run_delete(app_state: Arc<Mutex<AppState>>, repo_idx: usize, branch
         Ok(()) => format!("Deleted {branch}"),
         Err(err) => format!("delete failed: {err}"),
     });
+    app.repos[repo_idx].lock().unwrap().page = None;
+}
+
+/// Fast-forward the selected repo-page row (a single branch or worktree), set a result
+/// banner, and reload the page so ahead/behind refresh.
+pub async fn run_pull_branch(app_state: Arc<Mutex<AppState>>, repo_idx: usize, row: PageRow) {
+    let (path, worktrees) = {
+        let app = app_state.lock().unwrap();
+        let repo = app.repos[repo_idx].lock().unwrap();
+        let worktrees = repo
+            .page
+            .as_ref()
+            .map(|page| page.worktrees.clone())
+            .unwrap_or_default();
+        (repo.path.clone(), worktrees)
+    };
+
+    let result = match row.kind {
+        PageRowKind::Worktree => pull_ff_only(&row.path).await,
+        PageRowKind::Branch => {
+            if row.is_head {
+                pull_ff_only(&path).await
+            } else if let Some(worktree) = worktrees.iter().find(|wt| wt.branch == row.branch) {
+                pull_ff_only(&worktree.path).await
+            } else if let Some(upstream) = row.upstream.as_deref() {
+                fetch_ff_branch(&path, upstream, &row.branch).await
+            } else {
+                Err(format!("'{}' has no upstream", row.branch))
+            }
+        }
+    };
+
+    let mut app = app_state.lock().unwrap();
+    app.repo_page_message = Some(match result {
+        Ok(PullOutcome::Updated) => format!("Pulled {}", row.branch),
+        Ok(_) => format!("{} already up to date", row.branch),
+        Err(err) => format!("pull failed: {err}"),
+    });
+    app.repos[repo_idx].lock().unwrap().page = None;
+}
+
+/// Fast-forward every fast-forwardable local branch of the repo, set a summary banner,
+/// and reload the page.
+pub async fn run_pull_all_branches(app_state: Arc<Mutex<AppState>>, repo_idx: usize) {
+    let Some((path, branches, worktrees)) = ({
+        let app = app_state.lock().unwrap();
+        let repo = app.repos[repo_idx].lock().unwrap();
+        repo.page.as_ref().map(|page| {
+            (repo.path.clone(), page.branches.clone(), page.worktrees.clone())
+        })
+    }) else {
+        return;
+    };
+
+    let summary = pull_all_branches(&path, &branches, &worktrees).await;
+    let failed = if summary.failed > 0 {
+        format!(", {} failed", summary.failed)
+    } else {
+        String::new()
+    };
+
+    let mut app = app_state.lock().unwrap();
+    app.repo_page_message = Some(format!(
+        "Pulled: {} updated, {} up-to-date, {} skipped{failed}",
+        summary.updated, summary.up_to_date, summary.skipped
+    ));
     app.repos[repo_idx].lock().unwrap().page = None;
 }
 

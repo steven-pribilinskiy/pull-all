@@ -183,7 +183,7 @@ pub async fn run_plain(
                     let stat_indented = if stat.is_empty() {
                         String::new()
                     } else {
-                        format!("{}\n\n", stat)
+                        format!("{stat}\n\n")
                     };
                     (format!("✅ {name}\n{stat_indented}"), "updated")
                 }
@@ -216,23 +216,26 @@ pub async fn run_plain(
         let _ = handle.await;
     }
 
-    let guard = results.lock().unwrap();
-    let mut updated = Vec::new();
-    let mut up_to_date = Vec::new();
-    let mut skipped = Vec::new();
-    let mut failed = Vec::new();
+    // Scope the lock so it is released before the later `.await` (no lock held across await).
+    let (updated, up_to_date, skipped, failed) = {
+        let guard = results.lock().unwrap();
+        let mut updated = Vec::new();
+        let mut up_to_date = Vec::new();
+        let mut skipped = Vec::new();
+        let mut failed = Vec::new();
 
-    for result in guard.iter().flatten() {
-        print!("{}", result.output);
-        match result.state {
-            "updated" => updated.push((result.name.clone(), result.branch.clone())),
-            "uptodate" => up_to_date.push((result.name.clone(), result.branch.clone())),
-            "skipped" => skipped.push((result.name.clone(), result.branch.clone())),
-            "failed" => failed.push((result.name.clone(), result.branch.clone())),
-            _ => {}
+        for result in guard.iter().flatten() {
+            print!("{}", result.output);
+            match result.state {
+                "updated" => updated.push((result.name.clone(), result.branch.clone())),
+                "uptodate" => up_to_date.push((result.name.clone(), result.branch.clone())),
+                "skipped" => skipped.push((result.name.clone(), result.branch.clone())),
+                "failed" => failed.push((result.name.clone(), result.branch.clone())),
+                _ => {}
+            }
         }
-    }
-    drop(guard);
+        (updated, up_to_date, skipped, failed)
+    };
 
     println!();
     println!("🎉 Pull completed!");

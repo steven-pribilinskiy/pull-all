@@ -299,7 +299,7 @@ pub fn parse_track(upstream: &str, track: &str) -> (Option<u32>, Option<u32>) {
         return (Some(0), Some(0));
     }
     let tokens: Vec<&str> = track
-        .split(|ch: char| ch == ',' || ch == ' ')
+        .split([',', ' '])
         .filter(|token| !token.is_empty())
         .collect();
     let mut ahead = 0u32;
@@ -449,6 +449,104 @@ pub async fn delete_branch(dir: &Path, branch: &str) -> Result<(), String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+/// Fast-forward the currently checked-out branch of `dir` to its upstream
+/// (`git merge --ff-only @{u}`). Used for the repo HEAD and worktree-checked-out branches.
+pub async fn pull_ff_only(dir: &Path) -> Result<PullOutcome, String> {
+    let dir_str = dir.to_str().unwrap_or(".");
+    let output = Command::new("git")
+        .args(["-C", dir_str, "merge", "--ff-only", "@{u}"])
+        .output()
+        .await
+        .map_err(|err| err.to_string())?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match classify_pull_output(&combined, output.status.success()) {
+        PullOutcome::Failed => Err(combined.trim().to_string()),
+        outcome => Ok(outcome),
+    }
+}
+
+/// Fast-forward a non-checked-out local branch by fetching its upstream into it
+/// (`git fetch <remote> <ref>:<local>`). The refspec only advances on fast-forward and
+/// is rejected otherwise, so this can never clobber local commits. `upstream` is the
+/// `origin/main`-style short upstream name.
+pub async fn fetch_ff_branch(repo: &Path, upstream: &str, local: &str) -> Result<PullOutcome, String> {
+    let Some((remote, remote_ref)) = upstream.split_once('/') else {
+        return Err(format!("malformed upstream '{upstream}'"));
+    };
+    let dir_str = repo.to_str().unwrap_or(".");
+    let refspec = format!("{remote_ref}:{local}");
+    let output = Command::new("git")
+        .args(["-C", dir_str, "fetch", remote, &refspec])
+        .output()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    // A no-op fetch prints nothing; an advancing one reports the ref update on stderr.
+    let progress = String::from_utf8_lossy(&output.stderr);
+    if progress.trim().is_empty() {
+        Ok(PullOutcome::AlreadyUpToDate)
+    } else {
+        Ok(PullOutcome::Updated)
+    }
+}
+
+/// Tally of a `pull_all_branches` pass over one repo.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PullAllSummary {
+    pub updated: u32,
+    pub up_to_date: u32,
+    pub skipped: u32,
+    pub failed: u32,
+}
+
+/// Fast-forward every local branch of `repo` that can be advanced cleanly:
+/// the HEAD and any worktree-checked-out branch via `merge --ff-only`, all other
+/// branches via a fetch refspec. Branches with no upstream, already up to date, or
+/// ahead/diverged (would not fast-forward) are left untouched.
+pub async fn pull_all_branches(
+    repo: &Path,
+    branches: &[BranchInfo],
+    worktrees: &[WorktreeInfo],
+) -> PullAllSummary {
+    let mut summary = PullAllSummary::default();
+    for branch in branches {
+        let Some(upstream) = branch.upstream.as_deref() else {
+            summary.skipped += 1;
+            continue;
+        };
+        let ahead = branch.ahead.unwrap_or(0);
+        let behind = branch.behind.unwrap_or(0);
+        if ahead > 0 {
+            // Diverged or ahead-only — a fast-forward can't apply.
+            summary.skipped += 1;
+            continue;
+        }
+        if behind == 0 {
+            summary.up_to_date += 1;
+            continue;
+        }
+        let result = if branch.is_head {
+            pull_ff_only(repo).await
+        } else if let Some(worktree) = worktrees.iter().find(|wt| wt.branch == branch.name) {
+            pull_ff_only(&worktree.path).await
+        } else {
+            fetch_ff_branch(repo, upstream, &branch.name).await
+        };
+        match result {
+            Ok(PullOutcome::Updated) => summary.updated += 1,
+            Ok(_) => summary.up_to_date += 1,
+            Err(_) => summary.failed += 1,
+        }
+    }
+    summary
 }
 
 #[cfg(test)]

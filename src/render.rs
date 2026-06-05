@@ -119,10 +119,54 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, position: usize, total: usize
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
+/// First case-insensitive (ASCII) occurrence of `needle` in `name_chars`, as a (start, len)
+/// pair in char units. Char-based so multibyte names stay aligned.
+fn find_ci(name_chars: &[char], needle: &str) -> Option<(usize, usize)> {
+    let needle_chars: Vec<char> = needle.chars().collect();
+    if needle_chars.is_empty() || needle_chars.len() > name_chars.len() {
+        return None;
+    }
+    (0..=name_chars.len() - needle_chars.len()).find_map(|start| {
+        let matches = name_chars[start..start + needle_chars.len()]
+            .iter()
+            .zip(&needle_chars)
+            .all(|(actual, wanted)| actual.eq_ignore_ascii_case(wanted));
+        matches.then_some((start, needle_chars.len()))
+    })
+}
+
+/// Repo-name spans for the list, underlining the substring that matches the active filter.
+/// Padded with trailing spaces to `width` chars in `base` style (no truncation, as before).
+fn highlight_name(name: &str, filter: Option<&str>, base: Style, width: usize) -> Vec<Span<'static>> {
+    let name_chars: Vec<char> = name.chars().collect();
+    let total = name_chars.len();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    match filter.filter(|f| !f.is_empty()).and_then(|f| find_ci(&name_chars, f)) {
+        Some((start, len)) => {
+            let before: String = name_chars[..start].iter().collect();
+            let matched: String = name_chars[start..start + len].iter().collect();
+            let after: String = name_chars[start + len..].iter().collect();
+            if !before.is_empty() {
+                spans.push(Span::styled(before, base));
+            }
+            spans.push(Span::styled(matched, base.add_modifier(Modifier::UNDERLINED)));
+            if !after.is_empty() {
+                spans.push(Span::styled(after, base));
+            }
+        }
+        None => spans.push(Span::styled(name.to_string(), base)),
+    }
+    if width > total {
+        spans.push(Span::styled(" ".repeat(width - total), base));
+    }
+    spans
+}
+
 fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) -> usize {
     let visible = app.visible_indices();
     let total_repos = app.repos.len();
-    let elapsed = app.start.elapsed().as_secs_f64();
+    let elapsed = app.finished_elapsed.unwrap_or_else(|| app.start.elapsed()).as_secs_f64();
 
     let done = app.done_count();
     let title = format!(
@@ -169,7 +213,6 @@ fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) -> usiz
             let state = app.repos[repo_idx].lock().unwrap();
             let glyph = status_glyph_colored(&state.status, tick);
 
-            let name_padded = format!("{:<width$}", state.name, width = name_col_width);
             let branch_str = state
                 .branch
                 .as_deref()
@@ -185,23 +228,30 @@ fn render_list(frame: &mut Frame, app: &AppState, area: Rect, tick: u64) -> usiz
                 _ => Style::default(),
             };
 
-            let mut spans = vec![
-                glyph,
-                Span::raw(" "),
-                Span::styled(name_padded, name_style),
-                Span::raw(" "),
-                Span::styled(format!("{branch_truncated:<branch_col_width$}"), Style::default().fg(Color::Cyan)),
-            ];
+            let mut spans = vec![glyph, Span::raw(" ")];
+            spans.extend(highlight_name(
+                &state.name,
+                app.filter.as_deref(),
+                name_style,
+                name_col_width,
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{branch_truncated:<branch_col_width$}"),
+                Style::default().fg(Color::Cyan),
+            ));
 
             if columns.ahead_behind {
-                let text = match &state.details {
-                    Some(details) => match (details.ahead, details.behind) {
-                        (Some(ahead), Some(behind)) => format!("↑{ahead} ↓{behind}"),
-                        _ => "—".to_string(),
-                    },
-                    None => "…".to_string(),
-                };
-                spans.push(Span::styled(format!(" {text:<9}"), Style::default().fg(Color::Yellow)));
+                spans.push(Span::raw(" "));
+                match &state.details {
+                    Some(details) => {
+                        spans.extend(ahead_behind_spans(details.ahead, details.behind, 9));
+                    }
+                    None => spans.push(Span::styled(
+                        format!("{:<9}", "…"),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                }
             }
             if columns.dirty {
                 let text = match &state.details {
@@ -307,6 +357,22 @@ fn render_preview(frame: &mut Frame, app: &AppState, area: Rect, _tick: u64) {
         return;
     }
 
+    // Pinned info (`I`): a compact info block above the log/diff, tracking the selection.
+    let area = if app.info_pinned && !show_result {
+        let repo_idx = visible[app.selected];
+        let name = app.repos[repo_idx].lock().unwrap().name.clone();
+        let lines = build_info_lines(app, repo_idx);
+        let desired = (lines.len() as u16 + 2).min(area.height / 2).max(3);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(desired), Constraint::Min(0)])
+            .split(area);
+        render_info_block(frame, app, chunks[0], format!(" {name} · info "), lines);
+        chunks[1]
+    } else {
+        area
+    };
+
     let (header_text, content_lines, scroll_offset) = if show_result {
         (" Result ".to_string(), build_result_summary(app), 0usize)
     } else {
@@ -379,20 +445,10 @@ fn render_preview(frame: &mut Frame, app: &AppState, area: Rect, _tick: u64) {
 
 /// Render the per-repo info view (status, branch, ahead/behind, remote, last commit,
 /// worktrees, changes, path) plus a command-hint footer, for the selected repo.
-fn render_info(frame: &mut Frame, app: &AppState, area: Rect, repo_idx: usize) {
+/// Build the per-repo info content lines (status, branch, ahead/behind, commit, changes,
+/// remote, worktrees, path) — shared by the full info view and the pinned info section.
+fn build_info_lines(app: &AppState, repo_idx: usize) -> Vec<Line<'static>> {
     let state = app.repos[repo_idx].lock().unwrap();
-
-    let border_style = if app.preview_focused {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let block = Block::default()
-        .title(format!(" {} · info ", state.name))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     let label = Style::default().fg(Color::DarkGray);
     let value = Style::default().fg(Color::Gray);
@@ -477,15 +533,38 @@ fn render_info(frame: &mut Frame, app: &AppState, area: Rect, repo_idx: usize) {
         },
     ));
     lines.push(field("Path", state.path.display().to_string()));
+    lines
+}
 
-    lines.push(Line::from(String::new()));
-    lines.push(Line::from(Span::styled(
-        "o open · y/Y copy · d diff · c claude · x clear",
-        label,
-    )));
-
+/// Render an info block (border + lines + scrollbar) into `area`.
+fn render_info_block(frame: &mut Frame, app: &AppState, area: Rect, title: String, lines: Vec<Line<'static>>) {
+    let border_style = if app.preview_focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    let total = lines.len();
+    frame.render_widget(block, area);
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+    render_scrollbar(frame, area, 0, total, inner.height as usize);
+}
+
+/// Full-pane info view (`i`): all fields plus a command-hint footer.
+fn render_info(frame: &mut Frame, app: &AppState, area: Rect, repo_idx: usize) {
+    let name = app.repos[repo_idx].lock().unwrap().name.clone();
+    let mut lines = build_info_lines(app, repo_idx);
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from(Span::styled(
+        "o open in browser · y/Y copy · d diff · c claude · x clear",
+        Style::default().fg(Color::DarkGray),
+    )));
+    render_info_block(frame, app, area, format!(" {name} · info "), lines);
 }
 
 /// Convert a string that may contain ANSI escape codes to a ratatui Line.
@@ -570,9 +649,7 @@ fn build_result_summary(app: &AppState) -> Vec<String> {
     lines.push(String::new());
 
     if total == 0 {
-        lines.push(format!(
-            "   No git repositories found."
-        ));
+        lines.push("   No git repositories found.".to_string());
         return lines;
     }
 
@@ -692,7 +769,7 @@ fn render_status_bar(frame: &mut Frame, app: &mut AppState, area: Rect) {
     let (_, running, _, _, _, _) = app.counts();
     let done = app.done_count();
     let total = app.repos.len();
-    let elapsed = app.start.elapsed().as_secs_f64();
+    let elapsed = app.finished_elapsed.unwrap_or_else(|| app.start.elapsed()).as_secs_f64();
 
     let hint = Style::default().fg(Color::DarkGray);
     let active = Style::default().fg(Color::Gray);
@@ -745,7 +822,7 @@ fn render_status_bar(frame: &mut Frame, app: &mut AppState, area: Rect) {
             vec![
                 (format!("{filter_tag}j/k ↑/↓ move · g/G top/end · space result · "), hint, None),
                 ("i".to_string(), active, Some(Command::Info)),
-                (" info · ".to_string(), hint, None),
+                ("/I info/pin · ".to_string(), hint, None),
                 ("t".to_string(), active, Some(Command::ToggleLeader)),
                 (" cols · ".to_string(), hint, None),
                 ("enter".to_string(), active, Some(Command::OpenPage)),
@@ -856,11 +933,13 @@ fn render_help(frame: &mut Frame, app: &mut AppState, area: Rect) {
     items.push(plain(""));
 
     items.push(header("HOTKEYS"));
-    items.push(plain("  Move     j/k  ↑/↓  ·  g/G top/end  ·  wheel scroll  ·  click a row to select"));
-    items.push(plain("  View     space result overlay  ·  tab list/preview focus  ·  PgUp/PgDn scroll preview  ·  End resume autoscroll"));
+    items.push(plain("  Move     j/k  ↑/↓  ·  g/G top/end  ·  Home/End jump  ·  PgUp/PgDn page  ·  wheel scroll  ·  click a row"));
+    items.push(plain("  View     space result overlay  ·  tab list/preview focus  ·  PgUp/PgDn scroll preview (focused)  ·  End resume autoscroll"));
     items.push(plain("  Retry    r selected · R all          (repos that failed or were skipped)"));
     items.push(plain("  Refetch  f selected · F all          (re-pull anything; skips in-progress)"));
-    items.push(plain("  Repo     i info · d diff · o open remote · y/Y copy path/url · c claude · x clear log"));
+    items.push(plain("  Repo     i info · I pin info · d diff · o open in browser · y/Y copy path/url · c claude · x clear log"));
+    items.push(plain("  Cols     t toggle mode (stays on) · a/d/l/w columns · Esc done"));
+    items.push(plain("  Page     enter open repo · p pull branch · P pull all branches · o open in browser · D delete · Home/End jump · esc back"));
     items.push(plain("  Layout   [ ] resize panes  ·  drag the divider to resize"));
     items.push(plain("  Filter   / filter by name  ·  Esc clear filter"));
     items.push(plain("  Other    ? this help  ·  q quit  ·  Ctrl-C exit"));
@@ -869,8 +948,12 @@ fn render_help(frame: &mut Frame, app: &mut AppState, area: Rect) {
     items.push(header("EXIT CODES"));
     items.push(plain("  0 all ok  ·  1 any failed  ·  2 quit mid-run  ·  130 Ctrl-C"));
 
-    let modal_width = area.width.saturating_sub(4).min(110).max(40);
-    let modal_height = area.height.saturating_sub(2).max(8);
+    // Size the box to its content (capped to the screen), not a fixed near-fullscreen slab.
+    let content_width = items.iter().map(|(line, _)| line.width()).max().unwrap_or(0) as u16;
+    let max_width = area.width.saturating_sub(2);
+    let max_height = area.height.saturating_sub(2);
+    let modal_width = (content_width + 4).min(max_width).max(40.min(max_width));
+    let modal_height = (items.len() as u16 + 2).min(max_height).max(8.min(max_height));
     let modal_area = centered_rect(modal_width, modal_height, area);
 
     let block = Block::default()
@@ -904,18 +987,35 @@ fn render_help(frame: &mut Frame, app: &mut AppState, area: Rect) {
     render_scrollbar(frame, modal_area, app.help_scroll, items.len(), inner_height);
 }
 
-/// A fixed-width ahead/behind span (`↑a ↓b`, or dim `(no upstream)`).
-fn ahead_behind_span(ahead: Option<u32>, behind: Option<u32>) -> Span<'static> {
+/// Fixed-width ahead/behind spans (`↑a ↓b`), each arrow colored by its own count: a zero
+/// count is dim gray, a positive ahead is yellow, a positive behind is cyan. No upstream
+/// renders a dim `—`. Padded with trailing spaces to `width` (counted in chars).
+fn ahead_behind_spans(ahead: Option<u32>, behind: Option<u32>, width: usize) -> Vec<Span<'static>> {
+    let gray = Style::default().fg(Color::DarkGray);
     match (ahead, behind) {
         (Some(ahead), Some(behind)) => {
-            let style = if ahead > 0 || behind > 0 {
+            let up = format!("↑{ahead}");
+            let down = format!("↓{behind}");
+            let used = up.chars().count() + 1 + down.chars().count();
+            let pad = width.saturating_sub(used);
+            let up_style = if ahead > 0 {
                 Style::default().fg(Color::Yellow)
             } else {
-                Style::default().fg(Color::DarkGray)
+                gray
             };
-            Span::styled(format!("{:<10}", format!("↑{ahead} ↓{behind}")), style)
+            let down_style = if behind > 0 {
+                Style::default().fg(Color::Cyan)
+            } else {
+                gray
+            };
+            vec![
+                Span::styled(up, up_style),
+                Span::raw(" "),
+                Span::styled(down, down_style),
+                Span::raw(" ".repeat(pad)),
+            ]
         }
-        _ => Span::styled(format!("{:<10}", "—"), Style::default().fg(Color::DarkGray)),
+        _ => vec![Span::styled(format!("{:<width$}", "—"), gray)],
     }
 }
 
@@ -956,7 +1056,7 @@ fn render_repo_page(frame: &mut Frame, app: &mut AppState, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(title)
         .title_bottom(
-            Line::from(" ↑↓ move · enter checkout · c claude · o open · y copy · D delete · esc back ")
+            Line::from(" ↑↓ move · Home/End · enter checkout · p pull · P pull all · c claude · o open in browser · y copy · D delete · esc back ")
                 .right_aligned(),
         );
     let inner = block.inner(area);
@@ -1013,18 +1113,12 @@ fn render_repo_page(frame: &mut Frame, app: &mut AppState, area: Rect) {
         let upstream = Span::styled(format!("  {}", row.upstream.clone().unwrap_or_default()), label);
         let date = Span::styled(format!("  {}", row.last_commit_rel), label);
         let subject = Span::styled(format!("  {}", truncate_str(&row.subject, 50)), label);
-        items.push((
-            Line::from(vec![
-                marker,
-                name_span,
-                Span::raw("  "),
-                ahead_behind_span(row.ahead, row.behind),
-                upstream,
-                date,
-                subject,
-            ]),
-            Some(sel_index),
-        ));
+        let mut line_spans = vec![marker, name_span, Span::raw("  ")];
+        line_spans.extend(ahead_behind_spans(row.ahead, row.behind, 10));
+        line_spans.push(upstream);
+        line_spans.push(date);
+        line_spans.push(subject);
+        items.push((Line::from(line_spans), Some(sel_index)));
     }
 
     items.push((Line::from(String::new()), None));
@@ -1036,15 +1130,13 @@ fn render_repo_page(frame: &mut Frame, app: &mut AppState, area: Rect) {
         if row.kind != PageRowKind::Worktree {
             continue;
         }
-        items.push((
-            Line::from(vec![
-                Span::styled(format!("  {:<name_pad$}", row.branch), cyan),
-                Span::raw("  "),
-                ahead_behind_span(row.ahead, row.behind),
-                Span::styled(format!("  {}", row.path.display()), label),
-            ]),
-            Some(sel_index),
-        ));
+        let mut line_spans = vec![
+            Span::styled(format!("  {:<name_pad$}", row.branch), cyan),
+            Span::raw("  "),
+        ];
+        line_spans.extend(ahead_behind_spans(row.ahead, row.behind, 10));
+        line_spans.push(Span::styled(format!("  {}", row.path.display()), label));
+        items.push((Line::from(line_spans), Some(sel_index)));
     }
 
     let inner_height = inner.height as usize;

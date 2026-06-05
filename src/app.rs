@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
+use serde::{Deserialize, Serialize};
 
 /// Maximum lines in the per-repo ring buffer.
 pub const RING_BUFFER_CAPACITY: usize = 10_000;
@@ -78,7 +79,7 @@ impl BranchInfo {
     /// Deletable from the UI: not the current branch, and no unpushed commits (ahead 0 or
     /// no upstream). `git branch -d` (merged-only) is the final safety net.
     pub fn deletable(&self) -> bool {
-        !self.is_head && self.ahead.map_or(true, |ahead| ahead == 0)
+        !self.is_head && self.ahead.is_none_or(|ahead| ahead == 0)
     }
 }
 
@@ -131,7 +132,7 @@ pub enum Column {
 }
 
 /// Which optional list columns are enabled.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ColumnFlags {
     pub ahead_behind: bool,
     pub dirty: bool,
@@ -291,8 +292,11 @@ pub struct AppState {
     pub filter: Option<String>,
     /// Filter input mode active?
     pub filter_input_mode: bool,
-    /// Wall-clock start time.
+    /// Wall-clock start time (reset to now whenever a fresh batch of work is kicked off).
     pub start: Instant,
+    /// Frozen elapsed once everything finished; `None` while work is running. Restarts (back to
+    /// `None`) on any re-run (`r`/`R`/`f`/`F`).
+    pub finished_elapsed: Option<Duration>,
     /// All pulls are done?
     pub all_done: bool,
     /// Number of jobs configured.
@@ -313,6 +317,8 @@ pub struct AppState {
     pub list_offset: usize,
     /// What the right pane shows for the selected repo (log, info, or diff).
     pub right_view: RightView,
+    /// Whether a compact info section is pinned above the log/diff (`I`).
+    pub info_pinned: bool,
     /// Whether the help modal (`?`) is open.
     pub show_help: bool,
     /// Scroll offset within the help modal.
@@ -343,6 +349,19 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(repos: Vec<SharedRepoState>, max_jobs: usize) -> Self {
+        // Restore persisted UI preferences (columns, info state, splitter), falling back to
+        // defaults for anything missing or invalid.
+        let persisted = crate::persist::load();
+        let split_ratio = if persisted.split_ratio >= Self::MIN_SPLIT {
+            persisted.split_ratio.clamp(Self::MIN_SPLIT, Self::MAX_SPLIT)
+        } else {
+            Self::DEFAULT_SPLIT
+        };
+        let right_view = if persisted.info_active {
+            RightView::Info
+        } else {
+            RightView::Log
+        };
         AppState {
             repos,
             worktrees: Vec::new(),
@@ -353,16 +372,18 @@ impl AppState {
             filter: None,
             filter_input_mode: false,
             start: Instant::now(),
+            finished_elapsed: None,
             all_done: false,
             max_jobs,
-            split_ratio: Self::DEFAULT_SPLIT,
+            split_ratio,
             result_overlay: false,
             main_area: Rect::default(),
             list_area: Rect::default(),
             preview_area: Rect::default(),
             divider_col: 0,
             list_offset: 0,
-            right_view: RightView::Log,
+            right_view,
+            info_pinned: persisted.info_pinned,
             show_help: false,
             help_scroll: 0,
             help_links: Vec::new(),
@@ -371,12 +392,22 @@ impl AppState {
             repo_page_scroll: 0,
             repo_page_message: None,
             confirm: None,
-            columns: ColumnFlags::default(),
+            columns: persisted.columns,
             pending_leader: None,
             details_pass_spawned: false,
             clickable: Vec::new(),
             repo_page_click: Vec::new(),
         }
+    }
+
+    /// Persist the current UI preferences (columns, info state, splitter) for the next run.
+    pub fn save_state(&self) {
+        crate::persist::save(&crate::persist::PersistedState {
+            columns: self.columns,
+            info_active: self.right_view == RightView::Info,
+            info_pinned: self.info_pinned,
+            split_ratio: self.split_ratio,
+        });
     }
 
     /// The URL of a clickable help-modal link at the given screen row, if any.
@@ -530,11 +561,11 @@ impl AppState {
             .any(|repo| repo.lock().unwrap().status.is_terminal())
     }
 
-    /// Navigate selection up, returns true if changed.
+    /// Navigate selection up, returns true if changed. The right-pane view is intentionally
+    /// preserved so an open info view (`i`) follows the selection across repos.
     pub fn nav_up(&mut self) -> bool {
         self.user_navigated = true;
         self.result_overlay = false;
-        self.right_view = RightView::Log;
         if self.selected > 0 {
             self.selected -= 1;
             true
@@ -547,7 +578,6 @@ impl AppState {
     pub fn nav_down(&mut self) -> bool {
         self.user_navigated = true;
         self.result_overlay = false;
-        self.right_view = RightView::Log;
         let max = self.list_len().saturating_sub(1);
         if self.selected < max {
             self.selected += 1;
@@ -560,15 +590,28 @@ impl AppState {
     pub fn nav_top(&mut self) {
         self.user_navigated = true;
         self.result_overlay = false;
-        self.right_view = RightView::Log;
         self.selected = 0;
     }
 
     pub fn nav_bottom(&mut self) {
         self.user_navigated = true;
         self.result_overlay = false;
-        self.right_view = RightView::Log;
         self.selected = self.list_len().saturating_sub(1);
+    }
+
+    /// Move the selection up by `step` rows (PageUp).
+    pub fn nav_page_up(&mut self, step: usize) {
+        self.user_navigated = true;
+        self.result_overlay = false;
+        self.selected = self.selected.saturating_sub(step.max(1));
+    }
+
+    /// Move the selection down by `step` rows (PageDown), clamped to the last row.
+    pub fn nav_page_down(&mut self, step: usize) {
+        self.user_navigated = true;
+        self.result_overlay = false;
+        let max = self.list_len().saturating_sub(1);
+        self.selected = (self.selected + step.max(1)).min(max);
     }
 
     /// Returns the repo index for the current selection, or None if Result is selected.

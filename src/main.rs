@@ -1,5 +1,6 @@
 mod app;
 mod git;
+mod persist;
 mod plain;
 mod profile;
 mod render;
@@ -30,8 +31,9 @@ use app::{
     RepoStatus, RightView, SharedRepoState,
 };
 use worker::{
-    run_all_details, run_all_pulls, run_checkout, run_delete, run_remote_url_discovery,
-    run_repo_details, run_repo_diff, run_repo_page, run_worktree_discovery,
+    run_all_details, run_all_pulls, run_checkout, run_delete, run_pull_all_branches,
+    run_pull_branch, run_remote_url_discovery, run_repo_details, run_repo_diff, run_repo_page,
+    run_worktree_discovery,
 };
 
 /// Interactive multi-repo git pull dashboard.
@@ -234,8 +236,9 @@ fn dispatch_command(command: Cmd, app: &mut AppState, retry_queue: &mut Vec<usiz
             };
         }
         Cmd::ToggleColumn(column) => {
+            // Stay in toggle mode (matches the sticky `t` keyboard behavior) so several
+            // columns can be clicked in a row; `t`/Esc or a non-toggle key exits.
             app.toggle_column(column);
-            app.pending_leader = None;
         }
         Cmd::Quit => {
             return Some(if app.all_done {
@@ -361,6 +364,9 @@ async fn run_tui(
 
     let exit_code = run_event_loop(&mut terminal, Arc::clone(&app_state)).await?;
 
+    // Persist UI preferences (columns, info state, splitter) for the next run.
+    app_state.lock().unwrap().save_state();
+
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -455,6 +461,7 @@ async fn run_event_loop(
 
             if all_done && !app.all_done {
                 app.all_done = true;
+                app.finished_elapsed = Some(app.start.elapsed());
                 if !app.user_navigated {
                     app.selected = app.list_len().saturating_sub(1);
                 }
@@ -481,6 +488,15 @@ async fn run_event_loop(
         if !retry_queue.is_empty() {
             let max_jobs = app_state.lock().unwrap().max_jobs;
             let timeout_secs = 30u64;
+
+            // A fresh batch of work is starting: restart the header timer and re-arm the
+            // all-done edge so it freezes again once this batch completes.
+            {
+                let mut app = app_state.lock().unwrap();
+                app.start = Instant::now();
+                app.finished_elapsed = None;
+                app.all_done = false;
+            }
 
             let repos_to_retry: Vec<SharedRepoState> = retry_queue
                 .drain(..)
@@ -716,8 +732,10 @@ async fn run_event_loop(
                         KeyCode::Char('k') | KeyCode::Up => {
                             app.repo_page_selected = app.repo_page_selected.saturating_sub(1);
                         }
-                        KeyCode::Char('g') => app.repo_page_selected = 0,
-                        KeyCode::Char('G') => app.repo_page_selected = len.saturating_sub(1),
+                        KeyCode::Char('g') | KeyCode::Home => app.repo_page_selected = 0,
+                        KeyCode::Char('G') | KeyCode::End => {
+                            app.repo_page_selected = len.saturating_sub(1)
+                        }
                         KeyCode::PageDown => {
                             app.repo_page_scroll = app.repo_page_scroll.saturating_add(10);
                         }
@@ -783,6 +801,30 @@ async fn run_event_loop(
                                 }
                             }
                         }
+                        // Fast-forward the selected branch/worktree.
+                        KeyCode::Char('p') => {
+                            if let (Some(idx), Some(row)) = (app.repo_page, app.repo_page_target()) {
+                                let app_state_clone = Arc::clone(&app_state);
+                                drop(app);
+                                tokio::spawn(run_pull_branch(app_state_clone, idx, row));
+                                continue;
+                            }
+                        }
+                        // Fast-forward every fast-forwardable local branch in the repo.
+                        KeyCode::Char('P') => {
+                            if let Some(idx) = app.repo_page {
+                                let loaded = {
+                                    let state = app.repos[idx].lock().unwrap();
+                                    state.page.is_some() && !state.page_loading
+                                };
+                                if loaded {
+                                    let app_state_clone = Arc::clone(&app_state);
+                                    drop(app);
+                                    tokio::spawn(run_pull_all_branches(app_state_clone, idx));
+                                    continue;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     continue;
@@ -819,16 +861,17 @@ async fn run_event_loop(
                     continue;
                 }
 
-                // `t` leader chord: the next key toggles a column (a/d/l/w), anything else cancels.
+                // `t` toggle mode: stays active so multiple columns can be toggled (a/d/l/w);
+                // `t` again or Esc exits, any other key is swallowed to avoid stray navigation.
                 if app.pending_leader == Some(Leader::Toggle) {
                     match key.code {
                         KeyCode::Char('a') => app.toggle_column(Column::AheadBehind),
                         KeyCode::Char('d') => app.toggle_column(Column::Dirty),
                         KeyCode::Char('l') => app.toggle_column(Column::LastCommit),
                         KeyCode::Char('w') => app.toggle_column(Column::Worktrees),
+                        KeyCode::Char('t') | KeyCode::Esc => app.pending_leader = None,
                         _ => {}
                     }
-                    app.pending_leader = None;
                     continue;
                 }
 
@@ -927,6 +970,18 @@ async fn run_event_loop(
                         }
                     }
 
+                    // List navigation: jump and page (when the preview isn't focused).
+                    (KeyCode::Home, _) => app.nav_top(),
+                    (KeyCode::End, _) => app.nav_bottom(),
+                    (KeyCode::PageUp, _) => {
+                        let step = (app.list_area.height.saturating_sub(2)) as usize;
+                        app.nav_page_up(step);
+                    }
+                    (KeyCode::PageDown, _) => {
+                        let step = (app.list_area.height.saturating_sub(2)) as usize;
+                        app.nav_page_down(step);
+                    }
+
                     // Clear log buffer for selected repo
                     (KeyCode::Char('x'), _) => {
                         if let Some(repo_idx) = app.selected_repo_index() {
@@ -942,6 +997,10 @@ async fn run_event_loop(
                         } else {
                             RightView::Info
                         };
+                    }
+                    // Toggle a pinned info section above the log/diff (persists while navigating).
+                    (KeyCode::Char('I'), _) => {
+                        app.info_pinned = !app.info_pinned;
                     }
                     // Toggle the per-repo diff view in the right pane.
                     (KeyCode::Char('d'), _) => {
