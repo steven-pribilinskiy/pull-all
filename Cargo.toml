@@ -1,6 +1,6 @@
 [package]
 name = "pull-all"
-version = "1.0.0"
+version = "1.4.0"
 edition = "2024"
 
 [[bin]]
@@ -21,6 +21,8 @@ unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+terminal-colorsaurus = "1.0.3"
 
 [profile.release]
 lto = true

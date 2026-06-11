@@ -24,16 +24,21 @@ Press `t` to enter the column-toggle leader, then a column key. The mode stays a
 | `b` | Feature-branch count (local branches excluding `main`/`dev`) | `⑂N` (green) |
 | `s` | Stash count | `≡N` |
 
-Enabled columns persist across runs.
+Enabled columns persist across runs. Count columns render a **dim zero** (`⑂0`, `≡0`) rather
+than a blank, so the column stays recognizable. A column every repo leaves empty (no
+worktrees, no stashes, or `≤1` branch everywhere) auto-hides once its data has loaded, and its
+`t`-menu chip goes dim and inert until some repo has a value.
 
 ## Sorting
 
-Press `s` to enter the sort leader, then a column key — or click a column header. The
-2-row header shows a `▲`/`▼` indicator on the active sort column.
+Press `s` to enter the sort leader, then a column key — or click a column header (including
+the **branch** header). The 2-row header shows a `▲`/`▼` indicator on the active sort column.
+The list is always sorted — **Name ascending** is the default.
 
 | Key | Sort by |
 |-----|---------|
 | `n` | Name |
+| `c` | Checked-out branch |
 | `s` | Status |
 | `a` | Ahead / behind |
 | `d` | Dirty count |
@@ -41,7 +46,6 @@ Press `s` to enter the sort leader, then a column key — or click a column head
 | `w` | Worktree count |
 | `b` | Branch count |
 | `k` | Stash count |
-| `o` | None (discovery order) |
 
 Re-picking the same column (or re-clicking its header) flips the direction. The sort
 persists across runs.

@@ -16,10 +16,21 @@ import KeymapExplorer from '../../../components/KeymapExplorer.astro';
   `e`/`E` re-run any repo even if it was already up to date. In the status bar, `r`/`R`
   dim when no repo has an issue, and `e`/`E` dim when nothing is eligible.
 - **Sort the list** — press `s` then a column key (or click a column header) to sort by
-  name / status / ahead-behind / dirty / last-commit / worktrees / branches / stashes;
-  re-pick or re-click flips `▲`/`▼`. The order persists across runs.
+  name / branch / status / ahead-behind / dirty / last-commit / worktrees / branches / stashes;
+  re-pick or re-click flips `▲`/`▼`. The list is always sorted (Name asc by default) and the
+  order persists across runs.
 - **Status filter moved to `f`** — `f` then `a`/`u`/`c`/`s`/`f`/`i` filters the list by
   status (on top of the `/` name filter); `s` is now the sort leader.
+- **Views & folding** — `v g` toggles the [grouped list view](../groups/) and `v t` the
+  [directory-tree view](../tree-view/) (independent toggles → flat / grouped / tree / tree+groups);
+  `Z` re-resolves dynamic (`command`/`url`) group memberships. On a folder or collapsible group
+  header, `Enter`/`Space`/click collapse or expand the section; tree-style, `←` collapses the
+  selected header or jumps to its parent while `→` expands. Fold everything with `-` (collapse
+  all), `+`/`=` (expand all), `*` (expand subtree), or the vim-style `z` chord
+  (`za`/`zo`/`zc`/`zO`/`zM`/`zR`).
+- **Throttling** — if a remote rate-limits the run (HTTP 429 / "rate limit" / SSH connection
+  throttling), those repos get a distinct **throttled** state (`↯`), a warning banner appears,
+  concurrency is automatically halved, and the repos are re-queued with exponential backoff.
 - **Panes** — the focused pane (`Tab`, or `1`/`2`) shows a bright rounded border and a `[1]`/`[2]`
   label; the divider shows a grip and highlights while you drag it.
 - **`l` opens [lazygit](https://github.com/jesseduffield/lazygit)** — lazygit is a fast,
@@ -37,6 +48,11 @@ import KeymapExplorer from '../../../components/KeymapExplorer.astro';
   `pull-all` enables it when the terminal supports it (recent Windows Terminal, WezTerm,
   kitty, foot). On terminals without support, `Shift`+`Enter` falls back to plain `Enter`.
   :::
+- **Web-like mouse support** — whole status-bar hints are clickable (not just the key), the
+  active `⟪sort ▲⟫`/`[filter]`/`{status}` tags sit next to their hints and click to
+  flip/clear/reset, every modal has an `[x]` and closes on an outside click, settings rows and
+  radio chips are clickable, confirm dialogs have clickable `[y]`/`[n]`, and the repo page has
+  an `[esc back]` button.
 - **Clickable commands** — the action hints in the status bar (and the `t` column menu)
   are mouse-clickable; clicking runs the same command as the key.
 - **Scrollbars** — the repo list, the preview, the help modal, and the repo page all

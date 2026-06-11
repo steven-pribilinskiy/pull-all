@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::process::Command;
+use tokio::sync::{mpsc, Semaphore};
 
-use crate::app::{BranchInfo, DiffFile, RepoDetails, StashInfo, WorktreeInfo};
+use crate::app::{BranchInfo, BranchStats, DiffFile, RepoDetails, StashInfo, WorktreeInfo};
 
 /// Branches excluded from the feature-branch count.
 const EXCLUDED_BRANCHES: [&str; 2] = ["main", "dev"];
@@ -15,7 +17,28 @@ pub enum PullOutcome {
     Updated,
     /// The current branch has no upstream configured — not an error, nothing to pull.
     NoUpstream,
+    /// The remote throttled us (HTTP 429 / rate limit / SSH connection throttling). Distinct
+    /// from a plain failure so the UI can back off concurrency and retry, not just mark failed.
+    Throttled,
     Failed,
+}
+
+/// Whether combined git output looks like remote throttling (rate limiting / connection
+/// throttling) rather than a genuine failure. Checked on a lowercased copy.
+fn looks_throttled(lower: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "too many requests",
+        "rate limit",          // "rate limit exceeded", "API rate limit", "rate limited"
+        "returned error: 429", // git/curl HTTP form
+        "http/2 429",
+        "http 429",
+        "error: 429",
+        "kex_exchange_identification", // ssh: server dropped the connection (often throttling)
+        "connection reset by peer",
+        "connection closed by remote host",
+    ];
+    // Avoid false positives like "429 objects" in progress output by requiring a real marker.
+    MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 /// Parse combined stdout+stderr from `git pull` to determine outcome.
@@ -28,6 +51,9 @@ pub fn classify_pull_output(output: &str, exit_success: bool) -> PullOutcome {
             || output.contains("There is no tracking information")
         {
             return PullOutcome::NoUpstream;
+        }
+        if looks_throttled(&output.to_lowercase()) {
+            return PullOutcome::Throttled;
         }
         return PullOutcome::Failed;
     }
@@ -135,22 +161,111 @@ pub async fn discover_worktrees(cwd: &Path) -> Result<Vec<(String, String)>> {
     Ok(results)
 }
 
-/// Discover all git repos in `cwd` (immediate subdirs with `.git`).
-pub async fn discover_repos(cwd: &Path) -> Result<Vec<PathBuf>> {
-    let mut repos = Vec::new();
-    let mut dir_iter = tokio::fs::read_dir(cwd).await?;
+/// Directory names never descended into during the recursive scan (besides hidden dirs and
+/// `*.worktrees`): heavy dependency/build dirs that never hold sibling repos worth pulling.
+pub const PRUNE_DIRS: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "bower_components",
+    ".terraform",
+];
 
-    while let Some(entry) = dir_iter.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.contains(".worktrees") {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() && path.join(".git").exists() {
-            repos.push(path);
-        }
+/// Whether the recursive scan should descend into a child directory named `name`.
+/// Hidden dirs (`.`-prefixed, including `.git`), `*.worktrees`, and `PRUNE_DIRS` are skipped.
+pub fn should_descend(name: &str) -> bool {
+    if name.starts_with('.') || name.contains(".worktrees") {
+        return false;
     }
+    !PRUNE_DIRS.contains(&name)
+}
 
+/// `path` rendered relative to `root` with `/` separators (e.g. "personal/pull-all").
+/// Falls back to the full path when `path` isn't under `root`.
+pub fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// Recursively scan `root` for git repos (directories containing `.git`), streaming each found
+/// path over the returned channel as soon as it's discovered. Pruned per `should_descend`; never
+/// descends into a found repo (no nested-repo scan) and never treats `root` itself as a repo.
+/// `max_depth` caps the descent: 1 = immediate subdirs only (the legacy single-level behavior).
+/// The channel closes when the walk completes.
+pub fn spawn_repo_walker(root: PathBuf, max_depth: usize) -> mpsc::UnboundedReceiver<PathBuf> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let semaphore = Arc::new(Semaphore::new(64));
+    tokio::spawn(async move {
+        walk_dir(root, 0, max_depth, tx, semaphore).await;
+    });
+    rx
+}
+
+/// One node of the recursive walk: emit `dir` if it's a repo (depth ≥ 1), else fan out into its
+/// descendable children up to `max_depth`. Boxed because it recurses through an async fn.
+fn walk_dir(
+    dir: PathBuf,
+    depth: usize,
+    max_depth: usize,
+    tx: mpsc::UnboundedSender<PathBuf>,
+    semaphore: Arc<Semaphore>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        // The root (depth 0) is never itself a pull target — only its descendants are.
+        if depth >= 1 && dir.join(".git").exists() {
+            let _ = tx.send(dir);
+            return;
+        }
+        if depth >= max_depth {
+            return;
+        }
+        let entries = {
+            let _permit = semaphore.acquire().await;
+            let mut entries = Vec::new();
+            if let Ok(mut iter) = tokio::fs::read_dir(&dir).await {
+                while let Ok(Some(entry)) = iter.next_entry().await {
+                    entries.push(entry);
+                }
+            }
+            entries
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !should_descend(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                children.push(walk_dir(
+                    path,
+                    depth + 1,
+                    max_depth,
+                    tx.clone(),
+                    Arc::clone(&semaphore),
+                ));
+            }
+        }
+        futures::future::join_all(children).await;
+    })
+}
+
+/// Collect every git repo under `root` (up to `max_depth`), sorted by path. The blocking
+/// (collect-all) counterpart to `spawn_repo_walker`, used by the plain (`--no-tui`) path.
+pub async fn discover_repos_recursive(root: &Path, max_depth: usize) -> Result<Vec<PathBuf>> {
+    let mut rx = spawn_repo_walker(root.to_path_buf(), max_depth);
+    let mut repos = Vec::new();
+    while let Some(path) = rx.recv().await {
+        repos.push(path);
+    }
     repos.sort();
     Ok(repos)
 }
@@ -457,6 +572,54 @@ pub async fn branch_file_diff(dir: &Path, branch: &str, path: &str) -> Vec<Strin
     run_diff(&["-C", dir_str, "diff", "--color=always", &merge_base, branch, "--", path]).await
 }
 
+/// Count `--name-status` lines into (added, modified, deleted): A and untracked `?` are added,
+/// D is deleted, and M/T plus renames/copies (R*/C*) count as modified. Pure for unit tests.
+pub fn count_name_status(stdout: &str) -> (u32, u32, u32) {
+    let (mut added, mut modified, mut deleted) = (0u32, 0u32, 0u32);
+    for line in stdout.lines() {
+        let Some(status) = line.split('\t').next().and_then(|field| field.chars().next()) else {
+            continue;
+        };
+        match status.to_ascii_uppercase() {
+            'A' | '?' => added += 1,
+            'D' => deleted += 1,
+            'M' | 'T' | 'R' | 'C' => modified += 1,
+            _ => {}
+        }
+    }
+    (added, modified, deleted)
+}
+
+/// Per-branch change stats vs the merge-base with `base` (one `git diff --name-status`). `None`
+/// when the diff can't be produced. `merge_base` is resolved once per page and passed in.
+pub async fn branch_diff_stats(dir: &Path, merge_base: &str, branch: &str) -> Option<BranchStats> {
+    let dir_str = dir.to_str().unwrap_or(".");
+    let output = Command::new("git")
+        .args(["-C", dir_str, "diff", "--name-status", merge_base, branch])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let (added, modified, deleted) = count_name_status(&String::from_utf8_lossy(&output.stdout));
+    Some(BranchStats { added, modified, deleted })
+}
+
+/// Merge-base sha of `branch` and an already-resolved base branch ref. Falls back to the ref.
+pub async fn merge_base_with(dir: &Path, base: &str, branch: &str) -> Option<String> {
+    let dir_str = dir.to_str().unwrap_or(".");
+    let output = Command::new("git")
+        .args(["-C", dir_str, "merge-base", base, branch])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return Some(base.to_string());
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Parse `--name-status` output (`STATUS\tPATH`, or `R100\tOLD\tNEW` for renames) into files.
 fn parse_name_status(stdout: &str) -> Vec<DiffFile> {
     stdout
@@ -663,7 +826,8 @@ pub fn parse_track(upstream: &str, track: &str) -> (Option<u32>, Option<u32>) {
     (Some(ahead), Some(behind))
 }
 
-/// Parse one US (0x1f)-separated `for-each-ref` line into a BranchInfo.
+/// Parse one US (0x1f)-separated `for-each-ref` line into a BranchInfo. Fields 6 (short sha)
+/// and 7 (author) are tolerated as absent for forward/backward compatibility.
 fn parse_branch_line(line: &str) -> Option<BranchInfo> {
     let fields: Vec<&str> = line.split('\u{1f}').collect();
     if fields.len() < 6 || fields[1].is_empty() {
@@ -683,13 +847,18 @@ fn parse_branch_line(line: &str) -> Option<BranchInfo> {
         behind,
         last_commit_rel: fields[4].to_string(),
         subject: fields[5].to_string(),
+        commit_sha: fields.get(6).map(|sha| sha.to_string()).unwrap_or_default(),
+        author: fields.get(7).map(|author| author.to_string()).unwrap_or_default(),
+        stats: None,
+        merge_base_short: None,
     })
 }
 
-/// List local branches (most-recent first) with upstream, ahead/behind, last-commit date, subject.
+/// List local branches (most-recent first) with upstream, ahead/behind, last-commit date,
+/// subject, short sha, and author.
 pub async fn list_local_branches(dir: &Path) -> Vec<BranchInfo> {
     let dir_str = dir.to_str().unwrap_or(".");
-    let format = "%(HEAD)%1f%(refname:short)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:relative)%1f%(contents:subject)";
+    let format = "%(HEAD)%1f%(refname:short)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:relative)%1f%(contents:subject)%1f%(objectname:short)%1f%(authorname)";
     let output = match Command::new("git")
         .args([
             "-C",
@@ -1159,8 +1328,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_branch_line_splits_six_us_fields() {
-        let line = "*\u{1f}main\u{1f}origin/main\u{1f}ahead 1\u{1f}3 days ago\u{1f}init repo";
+    fn parse_branch_line_splits_us_fields() {
+        let line = "*\u{1f}main\u{1f}origin/main\u{1f}ahead 1\u{1f}3 days ago\u{1f}init repo\u{1f}abc1234\u{1f}Ada";
         let branch = parse_branch_line(line).expect("parses");
         assert!(branch.is_head);
         assert_eq!(branch.name, "main");
@@ -1168,6 +1337,128 @@ mod tests {
         assert_eq!((branch.ahead, branch.behind), (Some(1), Some(0)));
         assert_eq!(branch.last_commit_rel, "3 days ago");
         assert_eq!(branch.subject, "init repo");
+        assert_eq!(branch.commit_sha, "abc1234");
+        assert_eq!(branch.author, "Ada");
+        assert_eq!(branch.stats, None);
+    }
+
+    #[test]
+    fn parse_branch_line_tolerates_missing_sha_author() {
+        // Old six-field format (no sha/author) still parses, with empty extras.
+        let line = "*\u{1f}main\u{1f}origin/main\u{1f}ahead 1\u{1f}3 days ago\u{1f}init repo";
+        let branch = parse_branch_line(line).expect("parses");
+        assert_eq!(branch.commit_sha, "");
+        assert_eq!(branch.author, "");
+    }
+
+    #[test]
+    fn count_name_status_buckets_letters() {
+        let stdout = "M\tsrc/a.rs\nA\tsrc/b.rs\nD\tsrc/c.rs\nR100\told.rs\tnew.rs\n?\tuntracked.rs\nC75\tx.rs\ty.rs\n";
+        // M + R + C = 3 modified; A + ? = 2 added; D = 1 deleted.
+        assert_eq!(count_name_status(stdout), (2, 3, 1));
+    }
+
+    #[test]
+    fn classify_detects_throttling_distinct_from_failure() {
+        for output in [
+            "fatal: unable to access '...': The requested URL returned error: 429\n",
+            "remote: You have exceeded a secondary rate limit.\nfatal: rate limit\n",
+            "error: RPC failed; HTTP 429 curl 22\n",
+            "kex_exchange_identification: Connection closed by remote host\n",
+            "fatal: Could not read from remote repository\nConnection reset by peer\n",
+        ] {
+            assert_eq!(
+                classify_pull_output(output, false),
+                PullOutcome::Throttled,
+                "should be Throttled: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_does_not_mistake_progress_or_plain_failure_for_throttling() {
+        // "429 objects" in progress is not throttling.
+        assert_eq!(
+            classify_pull_output("Receiving objects: 100% (429/429)\n", false),
+            PullOutcome::Failed
+        );
+        assert_eq!(
+            classify_pull_output("error: Your local changes would be overwritten\n", false),
+            PullOutcome::Failed
+        );
+        // A throttle marker on a SUCCESSFUL pull is still Updated (exit 0 wins).
+        assert_eq!(classify_pull_output("rate limit note\nFast-forward\n", true), PullOutcome::Updated);
+    }
+
+    #[test]
+    fn should_descend_skips_hidden_pruned_and_worktrees() {
+        assert!(should_descend("projects"));
+        assert!(should_descend("my-repo"));
+        assert!(!should_descend(".git"));
+        assert!(!should_descend(".cache"));
+        assert!(!should_descend("node_modules"));
+        assert!(!should_descend("target"));
+        assert!(!should_descend("vendor"));
+        assert!(!should_descend("my-repo.worktrees"));
+    }
+
+    #[test]
+    fn relative_path_renders_under_root() {
+        let root = std::path::Path::new("/home/me/projects");
+        assert_eq!(relative_path(root, std::path::Path::new("/home/me/projects/a")), "a");
+        assert_eq!(
+            relative_path(root, std::path::Path::new("/home/me/projects/personal/pull-all")),
+            "personal/pull-all"
+        );
+        // Not under root → full path is kept.
+        assert_eq!(relative_path(root, std::path::Path::new("/elsewhere/x")), "/elsewhere/x");
+    }
+
+    /// Build a throwaway directory tree under a unique temp dir; returns its root for cleanup.
+    fn build_tree(dirs_with_git: &[&str], plain_dirs: &[&str]) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("pull-all-walk-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in plain_dirs {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for dir in dirs_with_git {
+            std::fs::create_dir_all(root.join(dir).join(".git")).unwrap();
+        }
+        root
+    }
+
+    #[tokio::test]
+    async fn walker_finds_nested_repos_and_prunes() {
+        let root = build_tree(
+            &[
+                "a",                 // depth 1 repo
+                "b/c",               // depth 2 repo
+                "d/e/f",             // depth 3 repo
+                "a/nested",          // inside repo a — must NOT be found (no descent into repos)
+                "node_modules/dep",  // pruned dir — must NOT be found
+                ".hidden/repo",      // hidden dir — must NOT be found
+                "g.worktrees/feat",  // worktree dir — must NOT be found
+            ],
+            &[],
+        );
+        let mut found = discover_repos_recursive(&root, 16).await.unwrap();
+        found.sort();
+        let rels: Vec<String> = found.iter().map(|path| relative_path(&root, path)).collect();
+        assert_eq!(rels, vec!["a", "b/c", "d/e/f"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn walker_depth_cap_limits_descent() {
+        let root = build_tree(&["a", "b/c", "d/e/f"], &[]);
+        let found = discover_repos_recursive(&root, 1).await.unwrap();
+        let rels: Vec<String> = found.iter().map(|path| relative_path(&root, path)).collect();
+        // depth 1 only: just the immediate-child repo.
+        assert_eq!(rels, vec!["a"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

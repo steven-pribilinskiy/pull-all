@@ -37,6 +37,8 @@ export default defineConfig({
             { label: 'Keybindings', slug: 'guides/keybindings' },
             { label: 'Repo page & diff modal', slug: 'guides/repo-page' },
             { label: 'Columns & glyphs', slug: 'guides/columns-and-glyphs' },
+            { label: 'Repo groups', slug: 'guides/groups' },
+            { label: 'Directory tree', slug: 'guides/tree-view' },
           ],
         },
         {

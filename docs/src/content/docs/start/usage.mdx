@@ -15,8 +15,20 @@ pull-all [DIR]
 pull-all
 ```
 
-`pull-all` scans `DIR` for git repositories (one level of children, plus
-`.worktrees/*/.git` worktrees), then fast-forwards each in parallel.
+`pull-all` scans `DIR` **recursively** for git repositories (pruning hidden /
+`node_modules` / `vendor` / `target` / `*.worktrees` dirs, and never descending into a found
+repo), then fast-forwards each in parallel as it's discovered. Point it at a whole tree:
+
+```bash
+pull-all ~/projects     # crawl every project
+pull-all ~ --depth 4    # crawl home, capped 4 levels deep
+pull-all --no-recursive # legacy single-level scan (immediate children only)
+```
+
+Render the result as a collapsible [directory tree](../../guides/tree-view/) with `v t`, or as
+named [groups](../../guides/groups/) with `v g`. The list title shows live concurrency
+(`⇄ active/cap`); if a remote rate-limits the run, `pull-all` backs off automatically (see
+the throttle banner) and retries with exponential backoff.
 
 ## Plain / headless mode
 
@@ -49,7 +61,8 @@ PULL_TIMEOUT=60 pull-all ~/projects
 
 - **Left `[1]`** — the repo list with a status glyph, name, and current branch. Optional
   [columns](../../guides/columns-and-glyphs/) add ahead/behind, dirty, last-commit,
-  worktree, branch, and stash counts, and a clickable column header lets you sort.
+  worktree, branch, and stash counts, and a clickable column header lets you sort. With
+  `z`, the list renders as named [group sections](../../guides/groups/).
 - **Right `[2]`** — a live log of the selected repo's pull output, or (with `i`) an info
   panel, or (with `d`) the working-tree / last-pull diff.
 
@@ -57,17 +70,41 @@ PULL_TIMEOUT=60 pull-all ~/projects
 divider between them (it shows a grip and highlights while dragging) or use `[` / `]`.
 
 <Aside type="tip">
-Press `?` at any time for the in-app help modal — two tabs (**Hotkeys** and **CLI & Flags**)
-switched with `Tab`, with clickable links to the repo and design notes.
+Press `?` at any time for the in-app help modal — four tabs (**Hotkeys**, **CLI & Flags**,
+**Legend** with every glyph in both icon sets, and **About**) switched with `Tab`, with
+clickable links to the repo and design notes.
 </Aside>
 
 ## Settings
 
-`,` opens a small settings modal (persisted in `~/.config/pull-all/state.json`):
+`,` opens a small settings modal (persisted in `~/.config/pull-all/state.json`), organized into
+a **General** section (panel padding, grouping) and a **Theming** section (icons, theme,
+background, contrast):
 
 - **Panel padding** — a 1-cell inner padding inside every bordered panel and modal.
 - **Icons** — switch the status / column / marker glyphs between the default Unicode set and
   an emoji set.
+- **Theme** — `dark` / `light` paint a full explicit palette (background, text, and every
+  accent color) so the app looks identical in any terminal. `auto` detects whether the
+  terminal background is dark or light at startup (OSC 11 query, then `COLORFGBG`, then the
+  Windows light/dark setting under WSL, then the macOS appearance setting) and applies the
+  matching palette.
+- **Background** and **Contrast** — two independent `normal` / `soft` axes. Background softens
+  the surface tones (background, selection, shadow); Contrast narrows the text/background
+  distance and desaturates the accent + semantic colors. They compose freely.
+- **Grouping** — render the list as named [group sections](../../guides/groups/) (same as `z`).
+
+The modal is fully mouse-driven too: click a row label to select it, click a radio chip to set
+that value, and close with the `[x]` button or a click anywhere outside. The same applies to
+every modal (help, confirm, copy menu, diff).
+
+## New-build reload
+
+pull-all watches its own binary while running. When a newer build lands at the same path
+(e.g. `make install`'s atomic rename), a notice appears in the top-right corner with a
+`[reload]` button — clicking it restores the terminal and `exec`s the new binary with the same
+arguments, so the fresh build takes over in the same terminal and re-runs the pulls. `[x]`
+dismisses the notice until the binary changes again.
 
 ## Reading the result
 

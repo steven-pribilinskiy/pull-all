@@ -1,9 +1,11 @@
 mod app;
 mod git;
+mod groups;
 mod persist;
 mod plain;
 mod profile;
 mod render;
+mod theme;
 mod worker;
 
 use std::io::{self, IsTerminal};
@@ -29,15 +31,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::{
-    AppState, Column, Command as Cmd, ConfirmAction, ConfirmDialog, DiffFocus, DiffSource, Leader,
-    PageRow, PageRowKind, RepoState, RepoStatus, RightView, SharedRepoState, SortColumn,
-    StatusFilter,
+    point_in, region_hit, AppState, Column, Command as Cmd, ConfirmAction, ConfirmDialog,
+    DiffFocus, DiffSource, Leader, PageRow, PageRowKind, RepoPageColumn, RepoStatus,
+    RightView, SharedRepoState, SortColumn, StatusFilter,
 };
 use worker::{
-    run_all_details, run_all_pulls, run_checkout, run_delete, run_diff_modal, run_diff_modal_file,
-    run_discard_changes, run_drop_stash, run_prepare_discard, run_prepare_drop_stash,
-    run_pull_all_branches, run_pull_branch, run_refetch_batch, run_remote_url_discovery,
-    run_remove_worktree, run_repo_details, run_repo_diff, run_repo_page, run_worktree_discovery,
+    run_all_details, run_checkout, run_delete, run_diff_modal, run_diff_modal_file,
+    run_discard_changes, run_discovery, run_drop_stash, run_prepare_discard,
+    run_prepare_drop_stash, run_pull_all_branches, run_pull_branch, run_refetch_batch,
+    run_remove_worktree, run_repo_details, run_repo_diff, run_repo_page,
 };
 
 /// Interactive multi-repo git pull dashboard.
@@ -59,6 +61,14 @@ struct Cli {
     /// Maximum concurrent pulls (default: nproc)
     #[arg(short = 'j', long, env = "PULL_JOBS")]
     jobs: Option<usize>,
+
+    /// Max directory depth to scan for repos (1 = immediate subdirs only)
+    #[arg(long, value_name = "N", default_value = "16")]
+    depth: usize,
+
+    /// Scan only the immediate subdirectories (same as --depth 1)
+    #[arg(long)]
+    no_recursive: bool,
 
     /// Force plain streaming output (no TUI)
     #[arg(long)]
@@ -89,6 +99,58 @@ async fn main() {
         1
     });
     std::process::exit(exit_code);
+}
+
+/// Sentinel exit code from the event loop meaning "exec the new binary" (never reaches the OS:
+/// `run_tui` intercepts it after restoring the terminal).
+const RELOAD_EXIT: i32 = i32::MIN;
+
+/// Spawn the worker for an accepted confirmation dialog (shared by the `y` key and the
+/// clickable `[y/enter] yes` button).
+fn spawn_confirm_action(app_state: &Arc<Mutex<AppState>>, action: ConfirmAction) {
+    let app_state = Arc::clone(app_state);
+    match action {
+        ConfirmAction::DeleteBranch { repo_idx, branch, force } => {
+            tokio::spawn(run_delete(app_state, repo_idx, branch, force));
+        }
+        ConfirmAction::DropStash { repo_idx, index } => {
+            tokio::spawn(run_drop_stash(app_state, repo_idx, index));
+        }
+        ConfirmAction::RemoveWorktree { repo_idx, path, force } => {
+            tokio::spawn(run_remove_worktree(app_state, repo_idx, path, force));
+        }
+        ConfirmAction::DiscardChanges { repo_idx, path } => {
+            tokio::spawn(run_discard_changes(app_state, repo_idx, path));
+        }
+    }
+}
+
+/// Watch the running executable's path for a newer build (atomic-rename installs change the
+/// file's mtime/length). On a change, raise the update notice; a fresh change re-arms a
+/// dismissed one. Polling a single stat every few seconds is negligible.
+async fn watch_for_new_build(app_state: Arc<Mutex<AppState>>) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(meta) = tokio::fs::metadata(&exe).await else {
+        return;
+    };
+    let mut last_seen = (meta.len(), meta.modified().ok());
+    let mut interval = tokio::time::interval(Duration::from_secs(3));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Ok(meta) = tokio::fs::metadata(&exe).await else {
+            continue; // mid-replace; the next tick sees the new file
+        };
+        let current = (meta.len(), meta.modified().ok());
+        if current != last_seen && meta.len() > 0 {
+            last_seen = current;
+            let mut app = app_state.lock().unwrap();
+            app.update_available = true;
+            app.update_dismissed = false;
+        }
+    }
 }
 
 /// If invoked as `pull-all go|bun|cli [args]`, replace this process with the matching
@@ -255,8 +317,15 @@ fn pop_key_enhancement(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 
 
 /// Apply a command triggered by key OR by clicking its status-bar hint. Returns
-/// `Some(exit_code)` when the command should quit the app.
-fn dispatch_command(command: Cmd, app: &mut AppState, retry_queue: &mut Vec<usize>) -> Option<i32> {
+/// `Some(exit_code)` when the command should quit the app. `pending_claude`/`pending_lazygit`
+/// are the event loop's suspend-to-launch slots (picked up at the top of the next iteration).
+fn dispatch_command(
+    command: Cmd,
+    app: &mut AppState,
+    retry_queue: &mut Vec<usize>,
+    pending_claude: &mut Option<std::path::PathBuf>,
+    pending_lazygit: &mut Option<std::path::PathBuf>,
+) -> Option<i32> {
     match command {
         Cmd::Retry => {
             if let Some(idx) = app.selected_repo_index() {
@@ -316,6 +385,68 @@ fn dispatch_command(command: Cmd, app: &mut AppState, retry_queue: &mut Vec<usiz
         Cmd::SetSort(column) => {
             app.set_sort(column);
             app.pending_leader = None;
+        }
+        Cmd::LeaderCancel => app.pending_leader = None,
+        Cmd::FlipSort => {
+            let column = app.sort_column;
+            app.set_sort(column); // re-applying the active column flips direction
+        }
+        Cmd::NameFilter => {
+            app.filter_input_mode = true;
+            if app.filter.is_none() {
+                app.filter = Some(String::new());
+            }
+        }
+        Cmd::ClearNameFilter => {
+            app.filter = None;
+            app.filter_input_mode = false;
+        }
+        Cmd::ResultOverlay => {
+            app.result_overlay = !app.result_overlay;
+        }
+        Cmd::FocusToggle => {
+            app.preview_focused = !app.preview_focused;
+        }
+        Cmd::SplitNarrow => app.adjust_split(-0.03),
+        Cmd::SplitWiden => app.adjust_split(0.03),
+        Cmd::GroupingToggle => app.toggle_grouping_view(),
+        Cmd::TreeToggle => app.toggle_tree_view(),
+        Cmd::FoldCollapseAll => app.collapse_all(),
+        Cmd::FoldExpandAll => app.expand_all(),
+        Cmd::FoldExpandSubtree => app.expand_subtree(),
+        Cmd::ToggleGroupCollapsed(group_idx) => app.toggle_group_collapsed(group_idx, None),
+        Cmd::DiffView => app.toggle_diff_view(),
+        Cmd::Claude => {
+            if let Some(idx) = app.selected_repo_index() {
+                *pending_claude = Some(app.repos[idx].lock().unwrap().path.clone());
+            }
+        }
+        Cmd::Lazygit => {
+            if let Some(idx) = app.selected_repo_index() {
+                *pending_lazygit = Some(app.repos[idx].lock().unwrap().path.clone());
+            }
+        }
+        Cmd::OpenRemote => {
+            let url = app
+                .selected_repo_index()
+                .and_then(|idx| app.repos[idx].lock().unwrap().remote_url.clone());
+            if let Some(url) = url {
+                open_url(&url);
+            }
+        }
+        Cmd::CopyPath => {
+            if let Some(idx) = app.selected_repo_index() {
+                let path = app.repos[idx].lock().unwrap().path.display().to_string();
+                copy_to_clipboard(&path);
+            }
+        }
+        Cmd::CopyRemote => {
+            let url = app
+                .selected_repo_index()
+                .and_then(|idx| app.repos[idx].lock().unwrap().remote_url.clone());
+            if let Some(url) = url {
+                copy_to_clipboard(&url);
+            }
         }
         Cmd::Settings => {
             app.show_settings = true;
@@ -395,6 +526,10 @@ async fn run() -> Result<i32> {
         .filter(|&jobs| jobs > 0)
         .unwrap_or_else(num_cpus::get);
 
+    // Recursive scanning is the default; `--no-recursive` (or `--depth 1`) restores the legacy
+    // single-level scan. `--depth 0` is meaningless, so floor it at 1.
+    let max_depth = if cli.no_recursive { 1 } else { cli.depth.max(1) };
+
     // Determine whether to use TUI
     let use_tui = !cli.no_tui && io::stderr().is_terminal();
 
@@ -404,6 +539,7 @@ async fn run() -> Result<i32> {
         return plain::run_plain(
             &cwd,
             max_jobs,
+            max_depth,
             cli.timeout,
             cli.no_worktrees,
             profiling,
@@ -415,6 +551,7 @@ async fn run() -> Result<i32> {
     run_tui(
         cwd,
         max_jobs,
+        max_depth,
         cli.timeout,
         cli.no_worktrees,
         profiling,
@@ -427,34 +564,33 @@ async fn run() -> Result<i32> {
 async fn run_tui(
     cwd: PathBuf,
     max_jobs: usize,
+    max_depth: usize,
     timeout_secs: u64,
     no_worktrees: bool,
     profiling: bool,
     profile_out: Option<PathBuf>,
 ) -> Result<i32> {
-    // Discover repos
-    let repo_paths = git::discover_repos(&cwd).await?;
+    // Repos stream in from the recursive walker (see `run_discovery` below); the list starts
+    // empty and grows as the scan progresses, so there's no up-front discovery wait.
 
-    if repo_paths.is_empty() {
-        eprintln!("No git repositories found in {}", cwd.display());
-        return Ok(0);
-    }
+    // Detect the terminal background for Theme::Auto — must happen before raw mode /
+    // the alternate screen (the OSC query reads its reply from the tty itself).
+    let auto_dark = theme::detect_dark_background();
 
-    let repos: Vec<SharedRepoState> = repo_paths
-        .iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default();
-            Arc::new(Mutex::new(RepoState::new(name, path.clone())))
-        })
-        .collect();
-
-    let app_state = Arc::new(Mutex::new(AppState::new(repos.clone(), max_jobs)));
-    // The scanned directory drives worktree re-discovery on refetch.
-    app_state.lock().unwrap().root_dir = cwd.clone();
-    let icon_style = app_state.lock().unwrap().icon_style;
+    let app_state = Arc::new(Mutex::new(AppState::new(Vec::new(), max_jobs, auto_dark)));
+    // Load group definitions (optional, user-edited) + the dynamic-membership cache.
+    let (groups_config, groups_config_error) = groups::load_config();
+    let groups_cache = groups::load_cache();
+    let icon_style = {
+        let mut app = app_state.lock().unwrap();
+        // The scanned directory drives worktree re-discovery on refetch.
+        app.root_dir = cwd.clone();
+        let group_errors = app.init_groups(groups_config, &groups_cache);
+        if let Some(error) = groups_config_error.or_else(|| group_errors.into_iter().next()) {
+            app.show_toast(error);
+        }
+        app.icon_style
+    };
 
     // Set up terminal
     enable_raw_mode()?;
@@ -477,26 +613,31 @@ async fn run_tui(
         original_hook(panic_info);
     }));
 
-    // Spawn pull workers
-    let repos_clone = repos.clone();
-    tokio::spawn(async move {
-        let _ = run_all_pulls(repos_clone, max_jobs, timeout_secs, icon_style).await;
-    });
+    // The shared concurrency gate + throttle governor (drives back-off + recovery).
+    let throttle = app_state.lock().unwrap().throttle.clone();
+    tokio::spawn(worker::run_governor(throttle.clone()));
 
-    // Discover origin remote URLs in the background for the help modal's clickable links.
-    let repos_for_urls = repos.clone();
-    tokio::spawn(async move {
-        run_remote_url_discovery(repos_for_urls, max_jobs).await;
-    });
+    // Stream repos in from the recursive walker: each batch is appended, its pulls + remote-url
+    // discovery kick off immediately, and worktree discovery runs once the walk completes.
+    tokio::spawn(run_discovery(
+        Arc::clone(&app_state),
+        cwd.clone(),
+        max_depth,
+        throttle,
+        max_jobs,
+        timeout_secs,
+        icon_style,
+        no_worktrees,
+    ));
 
-    // Spawn worktree discovery
-    if !no_worktrees {
-        let app_state_clone = Arc::clone(&app_state);
-        let cwd_clone = cwd.clone();
-        tokio::spawn(run_worktree_discovery(app_state_clone, cwd_clone));
-    } else {
-        app_state.lock().unwrap().worktrees_done = true;
+    // Resolve dynamic (command/url) group memberships in the background; the task no-ops when
+    // every dynamic group has a fresh cached membership.
+    if app_state.lock().unwrap().any_dynamic_groups() {
+        tokio::spawn(groups::run_group_resolution(Arc::clone(&app_state), false));
     }
+
+    // Watch the binary on disk for a newer build (drives the reload notice).
+    tokio::spawn(watch_for_new_build(Arc::clone(&app_state)));
 
     let exit_code = run_event_loop(&mut terminal, Arc::clone(&app_state)).await?;
 
@@ -508,6 +649,20 @@ async fn run_tui(
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
+
+    // Reload requested: replace this process with the new build, same argv. Never returns
+    // on success (the fresh process sets up its own terminal and re-runs the pulls).
+    if exit_code == RELOAD_EXIT {
+        // After a rename-over install, /proc/self/exe reads "<path> (deleted)" — strip the
+        // suffix so we exec the NEW file now living at the original path.
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pull-all"));
+        let exe_str = exe.to_string_lossy();
+        let exe = PathBuf::from(exe_str.strip_suffix(" (deleted)").unwrap_or(&exe_str));
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let error = Command::new(&exe).args(&args).exec();
+        eprintln!("error: reload failed: {error}");
+        return Ok(1);
+    }
 
     // Emit the profile report only after the alternate screen is left so it
     // doesn't corrupt the display.
@@ -532,6 +687,7 @@ fn build_profile_rows(app_state: &Arc<Mutex<AppState>>) -> Vec<profile::ProfileR
                 RepoStatus::UpToDate => "uptodate",
                 RepoStatus::NoUpstream => "noupstream",
                 RepoStatus::Skipped => "skipped",
+                RepoStatus::Throttled => "throttled",
                 RepoStatus::Failed => "failed",
                 RepoStatus::Running { .. } => "running",
                 RepoStatus::Queued => "queued",
@@ -615,10 +771,14 @@ async fn run_event_loop(
         // the user put it (no follow-the-running-repo, no jump-to-Result-when-complete).
         {
             let mut app = app_state.lock().unwrap();
-            let all_done = app.repos.iter().all(|repo| {
-                let state = repo.lock().unwrap();
-                state.status.is_terminal()
-            });
+            // Don't settle until the walker has finished AND found at least one repo — an empty
+            // `all(...)` is vacuously true, which would otherwise freeze the timer at 0 repos.
+            let all_done = app.discovery_done
+                && !app.repos.is_empty()
+                && app.repos.iter().all(|repo| {
+                    let state = repo.lock().unwrap();
+                    state.status.is_terminal()
+                });
 
             if all_done && !app.all_done {
                 app.all_done = true;
@@ -626,11 +786,19 @@ async fn run_event_loop(
             }
         }
 
+        // Pull throttled repos whose backoff has elapsed back into the retry queue.
+        {
+            let app = app_state.lock().unwrap();
+            let due = app.throttle.take_due_retries();
+            drop(app);
+            retry_queue.extend(due);
+        }
+
         // Process retry queue
         if !retry_queue.is_empty() {
-            let (max_jobs, icon_style, cwd) = {
+            let (control, max_jobs, icon_style) = {
                 let app = app_state.lock().unwrap();
-                (app.max_jobs, app.icon_style, app.root_dir.clone())
+                (app.throttle.clone(), app.max_jobs, app.icon_style)
             };
             let timeout_secs = 30u64;
 
@@ -665,10 +833,10 @@ async fn run_event_loop(
                 run_refetch_batch(
                     app_state_clone,
                     repos_to_retry,
+                    control,
                     max_jobs,
                     timeout_secs,
                     icon_style,
-                    cwd,
                 )
                 .await;
             });
@@ -723,8 +891,75 @@ async fn run_event_loop(
                     _ => {}
                 }
 
-                // Confirmation dialog and the copy menu are keyboard-only; ignore the mouse.
-                if app.confirm.is_some() || app.copy_menu.is_some() {
+                // New-build notice buttons work over any view (the notice renders above panes).
+                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                    if region_hit(app.update_close_click, mouse.column, mouse.row) {
+                        app.update_dismissed = true;
+                        continue;
+                    }
+                    if region_hit(app.update_reload_click, mouse.column, mouse.row) {
+                        drop(app);
+                        return Ok(RELOAD_EXIT);
+                    }
+                }
+
+                // Settings modal: click a row label to select it, a radio chip to set that
+                // value, [x] or anywhere outside to close. Everything else is swallowed so
+                // clicks never fall through to the view behind.
+                if app.show_settings {
+                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                        if region_hit(app.settings_close_click, mouse.column, mouse.row) {
+                            app.show_settings = false;
+                        } else if let Some((row_idx, option)) =
+                            app.settings_hit_at(mouse.column, mouse.row)
+                        {
+                            app.settings_selected = row_idx;
+                            if let Some(option_idx) = option {
+                                app.set_setting_option(row_idx, option_idx);
+                            }
+                        } else if !point_in(app.settings_area, mouse.column, mouse.row) {
+                            app.show_settings = false;
+                        }
+                    }
+                    continue;
+                }
+
+                // Confirmation dialog: clickable [y]/[n], [x] or outside to cancel.
+                if app.confirm.is_some() {
+                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                        if region_hit(app.confirm_yes_click, mouse.column, mouse.row) {
+                            let action = app.confirm.take().map(|dialog| dialog.action);
+                            if let Some(action) = action {
+                                drop(app);
+                                spawn_confirm_action(&app_state, action);
+                            }
+                        } else if region_hit(app.confirm_no_click, mouse.column, mouse.row)
+                            || region_hit(app.confirm_close_click, mouse.column, mouse.row)
+                            || !point_in(app.confirm_area, mouse.column, mouse.row)
+                        {
+                            app.confirm = None;
+                        }
+                    }
+                    continue;
+                }
+
+                // Copy menu: click an option to copy it, [x] or outside to close.
+                if app.copy_menu.is_some() {
+                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                        if region_hit(app.copy_menu_close_click, mouse.column, mouse.row)
+                            || !point_in(app.copy_menu_area, mouse.column, mouse.row)
+                        {
+                            app.copy_menu = None;
+                        } else if let Some(index) = app.copy_menu_option_at(mouse.row) {
+                            app.copy_menu = Some(index);
+                            let text = app.repo_page_target().map(|row| app.copy_menu_text(&row));
+                            app.copy_menu = None;
+                            if let Some(text) = text {
+                                drop(app);
+                                copy_to_clipboard(&text);
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -766,9 +1001,20 @@ async fn run_event_loop(
                                 modal.scroll = modal.scroll.saturating_sub(3);
                             }
                         }
-                        // Click a file row to view its diff.
+                        // Click a status chip to filter, a file row to view its diff; [x] or
+                        // outside the modal closes it.
                         MouseEventKind::Down(MouseButton::Left) => {
-                            if let Some(index) = app.diff_modal_file_at(mouse.row) {
+                            if region_hit(app.diff_modal_close_click, mouse.column, mouse.row)
+                                || !point_in(app.diff_modal_area, mouse.column, mouse.row)
+                            {
+                                app.diff_modal = None;
+                            } else if let Some(bucket) = app.diff_chip_at(mouse.column, mouse.row) {
+                                if app.diff_modal_set_filter(bucket) {
+                                    drop(app);
+                                    tokio::spawn(run_diff_modal_file(Arc::clone(&app_state)));
+                                    continue;
+                                }
+                            } else if let Some(index) = app.diff_modal_file_at(mouse.row) {
                                 if app.diff_modal_select_index(index) {
                                     drop(app);
                                     tokio::spawn(run_diff_modal_file(Arc::clone(&app_state)));
@@ -792,7 +1038,14 @@ async fn run_event_loop(
                             app.repo_page_scroll = app.repo_page_scroll.saturating_sub(3);
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
-                            if let Some(selection) = app.repo_page_row_at(mouse.row) {
+                            if region_hit(app.repo_page_back_click, mouse.column, mouse.row) {
+                                app.close_repo_page();
+                            } else if let Some(column) =
+                                app.repo_page_toggle_at(mouse.column, mouse.row)
+                            {
+                                app.toggle_repo_page_column(column);
+                                app.save_state();
+                            } else if let Some(selection) = app.repo_page_row_at(mouse.row) {
                                 app.repo_page_selected = selection;
                                 let double = last_click
                                     .map(|(when, previous)| {
@@ -828,7 +1081,9 @@ async fn run_event_loop(
                                 app.help_tab = tab;
                                 app.help_scroll = 0;
                                 app.save_state();
-                            } else if app.help_close_at(mouse.column, mouse.row) {
+                            } else if app.help_close_at(mouse.column, mouse.row)
+                                || !point_in(app.help_area, mouse.column, mouse.row)
+                            {
                                 app.show_help = false;
                             } else if let Some(url) = app.help_link_at(mouse.row) {
                                 drop(app);
@@ -859,8 +1114,13 @@ async fn run_event_loop(
                             })
                             .map(|region| region.command);
                         if let Some(command) = clicked {
-                            if let Some(code) = dispatch_command(command, &mut app, &mut retry_queue)
-                            {
+                            if let Some(code) = dispatch_command(
+                                command,
+                                &mut app,
+                                &mut retry_queue,
+                                &mut pending_claude,
+                                &mut pending_lazygit,
+                            ) {
                                 drop(app);
                                 return Ok(code);
                             }
@@ -883,18 +1143,24 @@ async fn run_event_loop(
                                 app.user_navigated = true;
                                 app.result_overlay = false;
                                 app.right_view = RightView::Log;
-                                // Synthesize double-click → open the repo page.
-                                let double = last_click
-                                    .map(|(when, previous)| {
-                                        previous == selection
-                                            && when.elapsed() < Duration::from_millis(400)
-                                    })
-                                    .unwrap_or(false);
-                                if double && app.selected_repo_index().is_some() {
-                                    app.open_repo_page();
+                                if app.toggle_selected_header() {
+                                    // Click a folder / group header: select it and toggle
+                                    // collapse (no double-click semantics on headers).
                                     last_click = None;
                                 } else {
-                                    last_click = Some((Instant::now(), selection));
+                                    // Synthesize double-click → open the repo page.
+                                    let double = last_click
+                                        .map(|(when, previous)| {
+                                            previous == selection
+                                                && when.elapsed() < Duration::from_millis(400)
+                                        })
+                                        .unwrap_or(false);
+                                    if double && app.selected_repo_index().is_some() {
+                                        app.open_repo_page();
+                                        last_click = None;
+                                    } else {
+                                        last_click = Some((Instant::now(), selection));
+                                    }
                                 }
                             }
                         }
@@ -975,22 +1241,8 @@ async fn run_event_loop(
                         KeyCode::Char('y') | KeyCode::Enter => {
                             let action = app.confirm.take().map(|dialog| dialog.action);
                             if let Some(action) = action {
-                                let app_state_clone = Arc::clone(&app_state);
                                 drop(app);
-                                match action {
-                                    ConfirmAction::DeleteBranch { repo_idx, branch, force } => {
-                                        tokio::spawn(run_delete(app_state_clone, repo_idx, branch, force));
-                                    }
-                                    ConfirmAction::DropStash { repo_idx, index } => {
-                                        tokio::spawn(run_drop_stash(app_state_clone, repo_idx, index));
-                                    }
-                                    ConfirmAction::RemoveWorktree { repo_idx, path, force } => {
-                                        tokio::spawn(run_remove_worktree(app_state_clone, repo_idx, path, force));
-                                    }
-                                    ConfirmAction::DiscardChanges { repo_idx, path } => {
-                                        tokio::spawn(run_discard_changes(app_state_clone, repo_idx, path));
-                                    }
-                                }
+                                spawn_confirm_action(&app_state, action);
                                 continue;
                             }
                         }
@@ -1149,9 +1401,29 @@ async fn run_event_loop(
                                 modal.scroll = usize::MAX;
                             }
                         }
-                        // Page keys always scroll the diff panel.
+                        // Shift/Alt+Page pages the file list (selection moves a viewport at a time).
+                        KeyCode::PageDown | KeyCode::PageUp
+                            if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                        {
+                            let step = app.diff_files_viewport.max(1) as isize;
+                            let delta = if key.code == KeyCode::PageUp { -step } else { step };
+                            if app.diff_modal_select(delta) {
+                                drop(app);
+                                refetch_file(&app_state);
+                                continue;
+                            }
+                        }
+                        // Plain Page keys always scroll the diff panel.
                         KeyCode::PageDown => scroll_by(&mut app, isize::try_from(page).unwrap_or(isize::MAX)),
                         KeyCode::PageUp => scroll_by(&mut app, -isize::try_from(page).unwrap_or(isize::MAX)),
+                        // `f` cycles the status filter (all → each present status → all).
+                        KeyCode::Char('f') => {
+                            if app.diff_modal_cycle_filter() {
+                                drop(app);
+                                refetch_file(&app_state);
+                                continue;
+                            }
+                        }
                         // `t` toggles the dirty-diff mode (uncommitted ⇄ base branch).
                         KeyCode::Char('t') => {
                             if app.diff_modal_toggle_mode() {
@@ -1219,6 +1491,36 @@ async fn run_event_loop(
                         drop(app);
                         return Ok(130);
                     }
+                    // Column-toggle menu: chip keys flip a column (stay in mode); esc/t close;
+                    // any other key exits and falls through to normal handling.
+                    if app.repo_page_toggle {
+                        let column = match key.code {
+                            KeyCode::Char('b') => Some(RepoPageColumn::AheadBehind),
+                            KeyCode::Char('y') => Some(RepoPageColumn::Dirty),
+                            KeyCode::Char('a') => Some(RepoPageColumn::Added),
+                            KeyCode::Char('m') => Some(RepoPageColumn::Modified),
+                            KeyCode::Char('d') => Some(RepoPageColumn::Deleted),
+                            KeyCode::Char('c') => Some(RepoPageColumn::Total),
+                            KeyCode::Char('u') => Some(RepoPageColumn::Upstream),
+                            KeyCode::Char('g') => Some(RepoPageColumn::Age),
+                            KeyCode::Char('s') => Some(RepoPageColumn::Subject),
+                            _ => None,
+                        };
+                        if let Some(column) = column {
+                            if app.repo_page_column_available(column) {
+                                app.toggle_repo_page_column(column);
+                                app.save_state();
+                            } else {
+                                app.show_toast("that column is empty for this repo");
+                            }
+                            continue;
+                        }
+                        app.repo_page_toggle = false;
+                        if matches!(key.code, KeyCode::Char('t') | KeyCode::Esc) {
+                            continue;
+                        }
+                        // Fall through: arrows/other keys exit the menu and act normally.
+                    }
                     let len = app.repo_page_selectable_len();
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => app.close_repo_page(),
@@ -1231,6 +1533,12 @@ async fn run_event_loop(
                         KeyCode::Char(',') => {
                             app.show_settings = true;
                             app.settings_selected = 0;
+                        }
+                        // `t` opens the column-toggle menu; `i` toggles the info panel.
+                        KeyCode::Char('t') => app.repo_page_toggle = true,
+                        KeyCode::Char('i') => {
+                            app.repo_page_info = !app.repo_page_info;
+                            app.save_state();
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if app.repo_page_selected + 1 < len {
@@ -1407,13 +1715,21 @@ async fn run_event_loop(
                 // `t` again or Esc exits. Navigation keys (up/down/home/end/enter) exit the mode
                 // and then run normally (fall through); any other key is swallowed.
                 if app.pending_leader == Some(Leader::Toggle) {
+                    // Toggle a column unless its data is trivially empty — then explain why.
+                    let toggle_or_warn = |app: &mut AppState, column: Column, noun: &str| {
+                        if app.column_available(column) {
+                            app.toggle_column(column);
+                        } else {
+                            app.show_toast(format!("no repo has any {noun} — nothing to show"));
+                        }
+                    };
                     match key.code {
                         KeyCode::Char('a') => app.toggle_column(Column::AheadBehind),
                         KeyCode::Char('d') => app.toggle_column(Column::Dirty),
                         KeyCode::Char('l') => app.toggle_column(Column::LastCommit),
-                        KeyCode::Char('w') => app.toggle_column(Column::Worktrees),
-                        KeyCode::Char('b') => app.toggle_column(Column::Branches),
-                        KeyCode::Char('s') => app.toggle_column(Column::Stashes),
+                        KeyCode::Char('w') => toggle_or_warn(&mut app, Column::Worktrees, "worktrees"),
+                        KeyCode::Char('b') => toggle_or_warn(&mut app, Column::Branches, "extra branches"),
+                        KeyCode::Char('s') => toggle_or_warn(&mut app, Column::Stashes, "stashes"),
                         KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Enter => {
                             // Exit toggle mode and let the key run normally below.
                             app.pending_leader = None;
@@ -1456,6 +1772,7 @@ async fn run_event_loop(
                 if app.pending_leader == Some(Leader::Sort) {
                     let picked = match key.code {
                         KeyCode::Char('n') => Some(SortColumn::Name),
+                        KeyCode::Char('c') => Some(SortColumn::Branch),
                         KeyCode::Char('s') => Some(SortColumn::Status),
                         KeyCode::Char('a') => Some(SortColumn::AheadBehind),
                         KeyCode::Char('d') => Some(SortColumn::Dirty),
@@ -1463,11 +1780,40 @@ async fn run_event_loop(
                         KeyCode::Char('w') => Some(SortColumn::Worktrees),
                         KeyCode::Char('b') => Some(SortColumn::Branches),
                         KeyCode::Char('k') => Some(SortColumn::Stashes),
-                        KeyCode::Char('o') => Some(SortColumn::Discovery),
                         _ => None,
                     };
                     if let Some(column) = picked {
                         app.set_sort(column);
+                    }
+                    app.pending_leader = None;
+                    continue;
+                }
+
+                // `v` view mode: pick grouped (`g`) or tree (`t`), then exit. Esc/any other
+                // key just closes the menu.
+                if app.pending_leader == Some(Leader::View) {
+                    match key.code {
+                        KeyCode::Char('g') => app.toggle_grouping_view(),
+                        KeyCode::Char('t') => app.toggle_tree_view(),
+                        _ => {}
+                    }
+                    app.pending_leader = None;
+                    continue;
+                }
+
+                // `z` fold mode (vim-style): za toggle · zo/zc open/close selected ·
+                // zO expand subtree · zM collapse all · zR expand all. Esc/other closes.
+                if app.pending_leader == Some(Leader::Fold) {
+                    match key.code {
+                        KeyCode::Char('a') => {
+                            app.toggle_selected_header();
+                        }
+                        KeyCode::Char('o') => app.nav_right(),
+                        KeyCode::Char('c') => app.nav_left(),
+                        KeyCode::Char('O') => app.expand_subtree(),
+                        KeyCode::Char('M') => app.collapse_all(),
+                        KeyCode::Char('R') => app.expand_all(),
+                        _ => {}
                     }
                     app.pending_leader = None;
                     continue;
@@ -1497,6 +1843,14 @@ async fn run_event_loop(
                     (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
                         app.nav_up();
                     }
+                    // Tree-style group navigation: ← jumps to the group header / collapses,
+                    // → expands a collapsed group.
+                    (KeyCode::Left, _) => {
+                        app.nav_left();
+                    }
+                    (KeyCode::Right, _) => {
+                        app.nav_right();
+                    }
                     (KeyCode::Char('g'), _) => {
                         app.nav_top();
                     }
@@ -1516,9 +1870,42 @@ async fn run_event_loop(
                         app.preview_focused = true;
                     }
 
-                    // Space: toggle the Result preview overlay (temporary switch).
+                    // Space: collapse/expand a selected group header, else toggle the Result
+                    // preview overlay (temporary switch).
                     (KeyCode::Char(' '), _) => {
-                        app.result_overlay = !app.result_overlay;
+                        if !app.toggle_selected_header() {
+                            app.result_overlay = !app.result_overlay;
+                        }
+                    }
+
+                    // `v` leader: arm the view-mode chord (`g` grouped · `t` tree).
+                    (KeyCode::Char('v'), _) => {
+                        app.pending_leader = Some(Leader::View);
+                    }
+                    // `z` leader: arm the fold chord (za/zo/zc/zO/zM/zR).
+                    (KeyCode::Char('z'), _) => {
+                        app.pending_leader = Some(Leader::Fold);
+                    }
+                    // Direct fold keys: `-` collapse all · `+`/`=` expand all · `*` expand subtree.
+                    (KeyCode::Char('-'), _) => app.collapse_all(),
+                    (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => app.expand_all(),
+                    (KeyCode::Char('*'), _) => app.expand_subtree(),
+                    // `Z`: re-resolve dynamic (command/url) group memberships now.
+                    (KeyCode::Char('Z'), _) => {
+                        if app.any_dynamic_groups() {
+                            for group in &mut app.groups {
+                                if group.source.is_dynamic() {
+                                    group.resolving = true;
+                                }
+                            }
+                            drop(app);
+                            tokio::spawn(groups::run_group_resolution(
+                                Arc::clone(&app_state),
+                                true,
+                            ));
+                        } else if !app.groups.is_empty() {
+                            app.show_toast("no dynamic groups to refresh");
+                        }
                     }
 
                     // Help modal
@@ -1617,21 +2004,7 @@ async fn run_event_loop(
                     }
                     // Toggle the per-repo diff view in the right pane.
                     (KeyCode::Char('d'), _) => {
-                        if app.right_view == RightView::Diff {
-                            // Toggling off: drop the cached diff so it refreshes next time.
-                            if let Some(repo_idx) = app.selected_repo_index() {
-                                app.repos[repo_idx].lock().unwrap().diff = None;
-                            }
-                            app.right_view = RightView::Log;
-                        } else {
-                            // Entering Diff: start at the top, not the log's scroll position.
-                            if let Some(repo_idx) = app.selected_repo_index() {
-                                let mut state = app.repos[repo_idx].lock().unwrap();
-                                state.preview_scroll = 0;
-                                state.auto_scroll = false;
-                            }
-                            app.right_view = RightView::Diff;
-                        }
+                        app.toggle_diff_view();
                     }
                     // Open the selected repo's remote in the browser.
                     (KeyCode::Char('o'), _) => {
@@ -1679,9 +2052,12 @@ async fn run_event_loop(
                         }
                     }
 
-                    // Enter / double-click: open the dedicated repo page for the selected repo.
+                    // Enter / double-click: collapse/expand a selected group header, else open
+                    // the dedicated repo page for the selected repo.
                     (KeyCode::Enter, _) => {
-                        app.open_repo_page();
+                        if !app.toggle_selected_header() {
+                            app.open_repo_page();
+                        }
                     }
 
                     // Retry selected repo if it has an issue (failed or skipped).

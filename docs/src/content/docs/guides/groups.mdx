@@ -1,0 +1,89 @@
+---
+title: Repo groups
+description: Group the repo list into named sections — by name pattern, static list, shell command, or a fetched JSON document.
+---
+
+Press `v g` to render the list as named **group sections**: each group gets a header row with
+per-status counts, repos inside a group keep the global sort and filters, and anything matching
+no group lands in a dim `ungrouped` section at the bottom. The toggle persists across runs and
+also lives in the settings modal (`,`).
+
+Grouping is independent of the [directory-tree view](../tree-view/) (`v t`) — turn both on for
+**tree + groups**, where groups subdivide the repos *inside each folder*.
+
+Groups are defined in `~/.config/pull-all/groups.json` — a hand-edited file that is never
+written by the app. No file means no groups: `v g` just shows a hint toast.
+
+## groups.json
+
+```json
+{
+  "collapse_threshold": 5,
+  "cache_ttl_minutes": 1440,
+  "groups": [
+    { "name": "frontend", "pattern": "mfe-*" },
+    { "name": "tooling", "repos": ["pull-all", "dotfiles"] },
+    { "name": "team", "command": "curl -fsSL https://example.com/repos.txt" },
+    {
+      "name": "platform",
+      "url": "https://example.com/remote-entries.json",
+      "extract": { "pointer": "/entries", "kind": "keys" }
+    }
+  ]
+}
+```
+
+Each group has a `name` and **exactly one** membership source. Groups render in config order;
+the first matching group wins when a repo matches several. Group and repo names are compared
+case-insensitively. Groups with no visible repos are hidden, and if *nothing* matches any
+group the list stays flat.
+
+## Membership sources
+
+| Source | Value | Resolved |
+|--------|-------|----------|
+| `pattern` | `*`-wildcard on the repo basename, e.g. `"mfe-*"`, `"*-service"`; **a pattern containing `/` matches the path relative to the scan root** (e.g. `"work/*"`) | instantly, per repo |
+| `repos` | explicit array of repo names | instantly |
+| `command` | shell command; each non-empty stdout line is a repo name | in the background, cached |
+| `url` | JSON document URL + an `extract` spec | in the background, cached |
+
+For `url` sources, `extract` says where the names live:
+
+- `pointer` — an [RFC 6901 JSON pointer](https://datatracker.ietf.org/doc/html/rfc6901) to the
+  node holding the names (`""`, the default, is the document root).
+- `kind` — `"keys"` (default) takes the keys of the object at the pointer; `"values"` takes the
+  string entries of an array (or the string values of an object), skipping non-strings.
+
+A `command` source is the escape hatch for anything else — pipe through `jq` yourself:
+
+```json
+{ "name": "team", "command": "curl -fsSL https://example.com/manifest.json | jq -r 'keys[]'" }
+```
+
+## Caching & refresh
+
+`command`/`url` sources never block startup. Resolved membership is cached at
+`~/.config/pull-all/groups-cache.json` and reused immediately on launch; sources are re-resolved
+in the background only when the cache is older than `cache_ttl_minutes` (default: 1440, i.e.
+daily) or missing. Press `Z` to force a re-resolve at any time. Editing a group's command/url in
+the config invalidates its cache entry automatically.
+
+A failed resolve (timeout after 10s, non-zero exit, HTTP error, bad JSON) keeps the cached
+membership, marks the group header with a dim `⚠`, and shows the error in a toast and in the
+group preview.
+
+## Collapsible headers
+
+Groups with **more** members than `collapse_threshold` (default: 5) get a collapsible header:
+it's selectable with `j`/`k`, shows `▾`/`▸`, and `Enter`, `Space`, or a click toggles collapse.
+`←` is the tree-style shortcut — on a repo it jumps to the enclosing header, on the header it
+collapses the section; `→` expands a collapsed section. The fold keys (`-`/`+`/`*`) and the
+vim-style `z` chord (`za`/`zo`/`zc`/`zO`/`zM`/`zR`) work on group headers too. Collapsed groups
+persist across runs. Smaller groups render a static header line that navigation and clicks skip
+over.
+
+In **tree + groups**, the same group can appear under several folders; each collapses
+independently (the collapse key is folder-scoped).
+
+Selecting a group header shows a group summary in the preview pane: source, member counts,
+per-status totals, cache age, and any resolution error.

@@ -10,10 +10,13 @@ use tokio::sync::Semaphore;
 use crate::app::WorktreeEntry;
 use crate::git::{classify_pull_output, diff_stat, discover_worktrees, get_branch, is_dirty, PullOutcome};
 
-/// Streaming (non-TUI) output matching the bash reference output byte-for-byte.
+/// Streaming (non-TUI) output. For a single-level scan (`--depth 1` / a flat directory) the
+/// output matches the bash reference byte-for-byte; a recursive scan additionally lists repos
+/// found in nested folders, named by their path relative to the scan root.
 pub async fn run_plain(
     cwd: &Path,
     max_jobs: usize,
+    max_depth: usize,
     timeout_secs: u64,
     no_worktrees: bool,
     profiling: bool,
@@ -26,8 +29,8 @@ pub async fn run_plain(
 
     println!("🔄 Pulling all repositories in {cwd_name}...");
 
-    // Discover repos
-    let repos = crate::git::discover_repos(cwd).await?;
+    // Discover repos (recursively, pruned; `--depth 1` keeps the legacy single-level scan).
+    let repos = crate::git::discover_repos_recursive(cwd, max_depth).await?;
 
     if repos.is_empty() {
         println!();
@@ -76,16 +79,12 @@ pub async fn run_plain(
 
     for (idx, path) in repos.iter().enumerate() {
         let path = path.clone();
+        let name = crate::git::relative_path(cwd, &path);
         let semaphore = Arc::clone(&semaphore);
         let results = Arc::clone(&results);
         let timeout = timeout_secs;
 
         let handle = tokio::spawn(async move {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
             let _permit = semaphore.acquire_owned().await.unwrap();
 
             let started = std::time::Instant::now();
@@ -181,6 +180,10 @@ pub async fn run_plain(
                 PullOutcome::NoUpstream => {
                     (format!("🔌 {name} (no upstream)\n"), "noupstream")
                 }
+                PullOutcome::Throttled => {
+                    // Plain mode is a one-shot batch — no auto-retry/backoff (TUI-only).
+                    (format!("🐢 {name} (throttled)\n"), "throttled")
+                }
                 PullOutcome::Updated => {
                     let stat = diff_stat(&path).await.unwrap_or_default();
                     let stat_indented = if stat.is_empty() {
@@ -220,12 +223,13 @@ pub async fn run_plain(
     }
 
     // Scope the lock so it is released before the later `.await` (no lock held across await).
-    let (updated, up_to_date, skipped, no_upstream, failed) = {
+    let (updated, up_to_date, skipped, no_upstream, throttled, failed) = {
         let guard = results.lock().unwrap();
         let mut updated = Vec::new();
         let mut up_to_date = Vec::new();
         let mut skipped = Vec::new();
         let mut no_upstream = Vec::new();
+        let mut throttled = Vec::new();
         let mut failed = Vec::new();
 
         for result in guard.iter().flatten() {
@@ -235,18 +239,23 @@ pub async fn run_plain(
                 "uptodate" => up_to_date.push((result.name.clone(), result.branch.clone())),
                 "skipped" => skipped.push((result.name.clone(), result.branch.clone())),
                 "noupstream" => no_upstream.push((result.name.clone(), result.branch.clone())),
+                "throttled" => throttled.push((result.name.clone(), result.branch.clone())),
                 "failed" => failed.push((result.name.clone(), result.branch.clone())),
                 _ => {}
             }
         }
-        (updated, up_to_date, skipped, no_upstream, failed)
+        (updated, up_to_date, skipped, no_upstream, throttled, failed)
     };
 
     println!();
     println!("🎉 Pull completed!");
 
-    let total =
-        updated.len() + up_to_date.len() + skipped.len() + no_upstream.len() + failed.len();
+    let total = updated.len()
+        + up_to_date.len()
+        + skipped.len()
+        + no_upstream.len()
+        + throttled.len()
+        + failed.len();
     let mut parts = Vec::new();
     if !updated.is_empty() {
         parts.push(format!("{} updated", updated.len()));
@@ -259,6 +268,9 @@ pub async fn run_plain(
     }
     if !no_upstream.is_empty() {
         parts.push(format!("{} no-upstream", no_upstream.len()));
+    }
+    if !throttled.is_empty() {
+        parts.push(format!("{} throttled", throttled.len()));
     }
     if !failed.is_empty() {
         parts.push(format!("{} failed", failed.len()));
@@ -299,6 +311,7 @@ pub async fn run_plain(
     print_section("📦 Unchanged repositories:", &up_to_date);
     print_section("⚠️  Skipped repositories (uncommitted changes):", &skipped);
     print_section("🔌 No-upstream repositories (nothing to pull):", &no_upstream);
+    print_section("🐢 Throttled repositories (rate-limited):", &throttled);
     print_section("❌ Failed repositories:", &failed);
 
     if !worktrees.is_empty() {
@@ -323,6 +336,7 @@ pub async fn run_plain(
                     "updated" => "updated",
                     "uptodate" => "uptodate",
                     "skipped" => "skipped",
+                    "throttled" => "throttled",
                     _ => "failed",
                 };
                 crate::profile::ProfileRow {

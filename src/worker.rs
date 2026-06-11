@@ -8,27 +8,28 @@ use tokio::sync::Semaphore;
 
 use crate::app::{
     AppState, CellFlash, ConfirmAction, ConfirmDialog, DiffMode, DiffSource, IconStyle, PageRow,
-    PageRowKind, RepoDetails, RepoPageData, RepoStatus, SharedRepoState, WorktreeEntry,
+    PageRowKind, RepoDetails, RepoPageData, RepoState, RepoStatus, SharedRepoState, ThrottleControl,
+    WorktreeEntry,
 };
 use crate::git::{
-    base_file_list, base_merge_base, branch_file_diff, branch_file_list, checkout_branch,
-    classify_pull_output, delete_branch, dirty_count,
+    base_file_list, base_merge_base, branch_diff_stats, branch_file_diff, branch_file_list,
+    checkout_branch, classify_pull_output, default_base_branch, delete_branch, dirty_count,
     diff_stat, discard_changes, discard_status, discover_worktrees, drop_stash, fetch_ff_branch,
     fetch_remote, file_diff_vs, get_branch, get_diff, get_remote_url, get_repo_details, is_dirty,
-    list_local_branches, list_stashes, list_worktrees, pull_all_branches, pull_ff_only,
-    remove_worktree, stash_file_diff, stash_file_list, stash_files, uncommitted_file_list,
-    PullOutcome,
+    list_local_branches, list_stashes, list_worktrees, merge_base_with, pull_all_branches,
+    pull_ff_only, remove_worktree, stash_file_diff, stash_file_list, stash_files,
+    uncommitted_file_list, PullOutcome,
 };
 
 /// Pull a single repository, updating `repo_state` as progress arrives.
 /// Signals completion via the state's status field.
 pub async fn pull_repo(
     repo_state: SharedRepoState,
-    semaphore: Arc<Semaphore>,
+    control: Arc<ThrottleControl>,
     timeout_secs: u64,
     icon_style: IconStyle,
 ) -> Result<()> {
-    let _permit = semaphore.acquire_owned().await?;
+    let _permit = Arc::clone(&control.semaphore).acquire_owned().await?;
     let icons = icon_style.icons();
 
     let started = std::time::Instant::now();
@@ -105,6 +106,29 @@ pub async fn pull_repo(
             state.elapsed = Some(started.elapsed());
             state.status = RepoStatus::Updated;
         }
+        PullOutcome::Throttled => {
+            // Tell the shared gate to back off, mark the repo, and schedule a backoff retry.
+            control.on_throttle();
+            let (idx, retries) = {
+                let mut state = repo_state.lock().unwrap();
+                state.elapsed = Some(elapsed);
+                state.status = RepoStatus::Throttled;
+                state.log.push(format!(
+                    "{} {name} throttled by remote — backing off",
+                    icons.retry_log
+                ));
+                (state.index, state.throttle_retries)
+            };
+            const MAX_THROTTLE_RETRIES: u8 = 3;
+            if retries < MAX_THROTTLE_RETRIES {
+                repo_state.lock().unwrap().throttle_retries = retries + 1;
+                // Exponential backoff (10s, 20s, 40s) + a small deterministic per-repo jitter.
+                let base = 10u64 << retries;
+                let jitter = (idx as u64 % 7) * 250;
+                let at = Instant::now() + Duration::from_secs(base) + Duration::from_millis(jitter);
+                control.schedule_retry(idx, at);
+            }
+        }
         PullOutcome::Failed => {
             let mut state = repo_state.lock().unwrap();
             state.elapsed = Some(elapsed);
@@ -113,6 +137,27 @@ pub async fn pull_repo(
     }
 
     Ok(())
+}
+
+/// Concurrency governor: enforces `ThrottleControl::effective()` by holding "ballast" permits
+/// (acquiring `configured - effective` of them so fewer pulls run), and restores the full cap
+/// once the remote has been quiet. Holds no `AppState` lock, so it never deadlocks the UI.
+pub async fn run_governor(control: Arc<ThrottleControl>) {
+    let mut ballast: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+    loop {
+        control.try_recover();
+        let target = control.configured().saturating_sub(control.effective());
+        // Tighten: grab more ballast as running pulls release their permits.
+        while ballast.len() < target {
+            match Arc::clone(&control.semaphore).acquire_owned().await {
+                Ok(permit) => ballast.push(permit),
+                Err(_) => return, // semaphore closed — app shutting down
+            }
+        }
+        // Loosen: dropping permits returns them to the semaphore for pulls to use.
+        ballast.truncate(target);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Run one `git pull --ff-only` attempt: spawn it (under `timeout`), set the repo Running,
@@ -178,41 +223,116 @@ async fn run_pull_attempt(
     Ok(classify_pull_output(&combined, exit_success))
 }
 
-/// Discover worktrees and update app_state when done.
-pub async fn run_worktree_discovery(app_state: Arc<Mutex<AppState>>, cwd: std::path::PathBuf) {
-    let entries = discover_worktrees(&cwd).await.unwrap_or_default();
-
-    let worktrees: Vec<WorktreeEntry> = entries
-        .into_iter()
-        .map(|(repo, branch)| WorktreeEntry { repo, branch })
-        .collect();
+/// Discover worktrees across every parent directory of the discovered repos (worktrees live as
+/// `<repo>.worktrees/` siblings), then update app_state. For a single-level scan this is just
+/// the scan root; for a recursive scan it covers each folder that holds repos.
+pub async fn run_worktree_discovery(app_state: Arc<Mutex<AppState>>) {
+    let dirs = { app_state.lock().unwrap().repo_parent_dirs() };
+    let mut worktrees: Vec<WorktreeEntry> = Vec::new();
+    for dir in dirs {
+        if let Ok(entries) = discover_worktrees(&dir).await {
+            worktrees.extend(
+                entries.into_iter().map(|(repo, branch)| WorktreeEntry { repo, branch }),
+            );
+        }
+    }
+    worktrees.sort_by(|first, second| {
+        first.repo.cmp(&second.repo).then(first.branch.cmp(&second.branch))
+    });
 
     let mut state = app_state.lock().unwrap();
     state.worktrees = worktrees;
     state.worktrees_done = true;
 }
 
+/// Stream repos in from the recursive walker: append each batch to `AppState` (keeping the
+/// selection on the same repo), kick off its pulls + remote-url discovery immediately, and on
+/// completion mark discovery done and run worktree discovery. This is the initial-run driver
+/// (replaces the up-front `run_all_pulls`); retry/refetch still use `run_all_pulls`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_discovery(
+    app_state: Arc<Mutex<AppState>>,
+    root: std::path::PathBuf,
+    max_depth: usize,
+    control: Arc<ThrottleControl>,
+    max_jobs: usize,
+    timeout_secs: u64,
+    icon_style: IconStyle,
+    no_worktrees: bool,
+) {
+    let mut rx = crate::git::spawn_repo_walker(root.clone(), max_depth);
+    let mut batch: Vec<std::path::PathBuf> = Vec::new();
+    loop {
+        batch.clear();
+        // Block for the first path, then drain whatever else is already queued (coalescing) so
+        // a burst of discoveries is appended in one lock + one group recompute.
+        let count = rx.recv_many(&mut batch, 128).await;
+        if count == 0 {
+            break; // walker finished and the channel closed
+        }
+
+        let new_repos: Vec<SharedRepoState> = {
+            let mut app = app_state.lock().unwrap();
+            let prev = app.selected_repo_index();
+            let mut new_repos = Vec::with_capacity(batch.len());
+            for path in &batch {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut state = RepoState::new(name, path.clone());
+                state.rel_path = crate::git::relative_path(&root, path);
+                state.index = app.repos.len();
+                let shared: SharedRepoState = Arc::new(Mutex::new(state));
+                app.repos.push(Arc::clone(&shared));
+                new_repos.push(shared);
+            }
+            app.recompute_group_assignments();
+            app.rebuild_tree();
+            app.reselect_repo(prev);
+            // Newly-streamed repos need details too — re-arm the background pass so the loop
+            // re-spawns it (it skips repos that already have details, so this is cheap).
+            app.details_pass_spawned = false;
+            new_repos
+        };
+
+        for repo in &new_repos {
+            let control = Arc::clone(&control);
+            tokio::spawn(pull_repo(Arc::clone(repo), control, timeout_secs, icon_style));
+        }
+        // Discover origin URLs for this batch (best-effort, for the clickable links).
+        tokio::spawn(run_remote_url_discovery(new_repos, max_jobs));
+    }
+
+    {
+        let mut app = app_state.lock().unwrap();
+        app.discovery_done = true;
+    }
+
+    if no_worktrees {
+        app_state.lock().unwrap().worktrees_done = true;
+    } else {
+        run_worktree_discovery(app_state).await;
+    }
+}
+
 /// Run all pulls concurrently (up to `max_jobs` at a time). `icon_style` selects the glyphs
 /// used in log markers (skip / retry) so they match the active setting.
 pub async fn run_all_pulls(
     repos: Vec<SharedRepoState>,
-    max_jobs: usize,
+    control: Arc<ThrottleControl>,
     timeout_secs: u64,
     icon_style: IconStyle,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(max_jobs));
     let mut handles = Vec::new();
-
     for repo_state in repos {
-        let semaphore = Arc::clone(&semaphore);
-        let handle = tokio::spawn(pull_repo(repo_state, semaphore, timeout_secs, icon_style));
+        let control = Arc::clone(&control);
+        let handle = tokio::spawn(pull_repo(repo_state, control, timeout_secs, icon_style));
         handles.push(handle);
     }
-
     for handle in handles {
         let _ = handle.await;
     }
-
     Ok(())
 }
 
@@ -263,6 +383,8 @@ pub async fn run_repo_diff(repo: SharedRepoState) {
 pub async fn run_repo_page(repo: SharedRepoState) {
     let path = { repo.lock().unwrap().path.clone() };
 
+    // Resolve the base branch once — per-branch stats all diff against its merge-base.
+    let base_branch = default_base_branch(&path).await;
     let branches = list_local_branches(&path).await;
     let worktrees = list_worktrees(&path).await;
     let stashes = list_stashes(&path).await;
@@ -284,22 +406,97 @@ pub async fn run_repo_page(repo: SharedRepoState) {
             dirty_worktrees: dirty_worktrees.clone(),
             fetched: false,
             fetch_error: None,
+            base_branch: base_branch.clone(),
         });
     }
+    // Per-branch A/M/D stats fill in asynchronously (cells show `…` until they land).
+    tokio::spawn(run_branch_stats(Arc::clone(&repo)));
 
     let fetch = fetch_remote(&path).await;
-    let branches = list_local_branches(&path).await;
-    let mut state = repo.lock().unwrap();
-    state.page = Some(RepoPageData {
-        branches,
-        worktrees,
-        stashes,
-        head_dirty_count,
-        dirty_worktrees,
-        fetched: true,
-        fetch_error: fetch.err(),
-    });
-    state.page_loading = false;
+    let mut branches = list_local_branches(&path).await;
+    // Carry over any stats already computed so the post-fetch rebuild doesn't reset them.
+    {
+        let state = repo.lock().unwrap();
+        if let Some(page) = state.page.as_ref() {
+            for branch in &mut branches {
+                if let Some(old) = page.branches.iter().find(|info| info.name == branch.name) {
+                    branch.stats = old.stats;
+                    branch.merge_base_short = old.merge_base_short.clone();
+                }
+            }
+        }
+    }
+    {
+        let mut state = repo.lock().unwrap();
+        state.page = Some(RepoPageData {
+            branches,
+            worktrees,
+            stashes,
+            head_dirty_count,
+            dirty_worktrees,
+            fetched: true,
+            fetch_error: fetch.err(),
+            base_branch,
+        });
+        state.page_loading = false;
+    }
+    // Compute stats for any branch that still lacks them (new refs the fetch revealed).
+    run_branch_stats(repo).await;
+}
+
+/// Per-branch change stats vs the base branch — one `git diff --name-status` per branch lacking
+/// stats, semaphore-bounded. Each result is written back individually (matched by branch name)
+/// so cells fill in as they land. Never holds the `AppState` lock.
+pub async fn run_branch_stats(repo: SharedRepoState) {
+    let (path, base, names) = {
+        let state = repo.lock().unwrap();
+        let Some(page) = state.page.as_ref() else {
+            return;
+        };
+        let names: Vec<String> = page
+            .branches
+            .iter()
+            .filter(|branch| branch.stats.is_none())
+            .map(|branch| branch.name.clone())
+            .collect();
+        (state.path.clone(), page.base_branch.clone(), names)
+    };
+    let Some(base) = base else {
+        return;
+    };
+    let semaphore = Arc::new(Semaphore::new(4));
+    let mut handles = Vec::new();
+    for name in names {
+        let repo = Arc::clone(&repo);
+        let path = path.clone();
+        let base = base.clone();
+        let semaphore = Arc::clone(&semaphore);
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let merge_base = merge_base_with(&path, &base, &name).await;
+            let stats = match &merge_base {
+                Some(point) => branch_diff_stats(&path, point, &name).await,
+                None => None,
+            };
+            let short = merge_base.map(|point| {
+                if point.len() >= 8 && point.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    point.chars().take(8).collect()
+                } else {
+                    point
+                }
+            });
+            let mut state = repo.lock().unwrap();
+            if let Some(page) = state.page.as_mut() {
+                if let Some(branch) = page.branches.iter_mut().find(|info| info.name == name) {
+                    branch.stats = Some(stats.unwrap_or_default());
+                    branch.merge_base_short = short;
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
 }
 
 /// Compute the diff lines for the currently open diff modal (based on its source + mode)
@@ -358,6 +555,7 @@ pub async fn run_diff_modal(app_state: Arc<Mutex<AppState>>) {
             modal.selected = 0;
             modal.file_scroll = 0;
             modal.loading = false;
+            modal.status_filter = None;
         }
     }
 
@@ -645,13 +843,14 @@ pub async fn run_pull_all_branches(app_state: Arc<Mutex<AppState>>, repo_idx: us
 /// Pull a batch of repos, then refresh ALL their cached data so the list columns and info
 /// panel reflect reality: re-fetch each repo's details (branch/stash/dirty counts, ahead/behind,
 /// last commit) and re-run worktree discovery. Used by refetch (`f`/`F`) and retry (`r`/`R`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_refetch_batch(
     app_state: Arc<Mutex<AppState>>,
     repos: Vec<SharedRepoState>,
+    control: Arc<ThrottleControl>,
     max_jobs: usize,
     timeout_secs: u64,
     icon_style: IconStyle,
-    cwd: std::path::PathBuf,
 ) {
     // Snapshot the pre-refetch status of each repo so we can flash a status change.
     let old_status: Vec<RepoStatus> =
@@ -669,7 +868,7 @@ pub async fn run_refetch_batch(
             .collect()
     };
 
-    let _ = run_all_pulls(repos.clone(), max_jobs, timeout_secs, icon_style).await;
+    let _ = run_all_pulls(repos.clone(), Arc::clone(&control), timeout_secs, icon_style).await;
 
     // Refresh per-repo details (the column/info source), bounded by the same concurrency cap.
     // Old values stay on screen the whole time; we diff old vs new and flash only what changed.
@@ -699,7 +898,7 @@ pub async fn run_refetch_batch(
 
     // Re-discover worktrees so the worktree column/list refreshes too, then flash repos whose
     // worktree count changed.
-    run_worktree_discovery(Arc::clone(&app_state), cwd).await;
+    run_worktree_discovery(Arc::clone(&app_state)).await;
     let app = app_state.lock().unwrap();
     for (repo, (name, old_count)) in repos.iter().zip(old_worktrees) {
         let new_count = app.worktrees.iter().filter(|wt| wt.repo == name).count();

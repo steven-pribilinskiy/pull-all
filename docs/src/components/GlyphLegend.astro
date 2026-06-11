@@ -8,6 +8,7 @@ const status: Glyph[] = [
   { glyph: '✓', tone: 'ok', label: 'Updated', note: 'fast-forwarded to new commits' },
   { glyph: '⊝', tone: 'dim', label: 'No upstream', note: 'branch has no upstream — nothing to pull (not an error)' },
   { glyph: '⊘', tone: 'dim', label: 'Skipped', note: 'dirty tree / not ff-able' },
+  { glyph: '↯', tone: 'magenta', label: 'Throttled', note: 'remote rate-limited — concurrency drops, auto-retried with backoff' },
   { glyph: '✗', tone: 'err', label: 'Failed', note: 'the pull errored' },
 ];
 

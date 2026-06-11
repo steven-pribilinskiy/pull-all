@@ -1,0 +1,67 @@
+---
+title: Directory tree
+description: Recursive discovery and the collapsible folder-tree view — fold keys, the four view modes, and how it composes with groups.
+---
+
+`pull-all` scans recursively by default and can render the result as a **collapsible directory
+tree**. Point it at `~/projects` (or even `~`) and it crawls the whole tree in parallel, pulling
+each repo as it's found.
+
+## Recursive discovery
+
+The scan walks the target directory in parallel, emitting each git repo (a directory containing
+`.git`) as soon as it's discovered — repos appear in the list and start pulling immediately, so
+there's no up-front wait. The walk is pruned so it stays fast even on a large home directory:
+
+- hidden directories (`.`-prefixed, including `.git`) are skipped,
+- heavy dependency/build dirs — `node_modules`, `vendor`, `target`, `dist`, `build`, `out`,
+  `__pycache__`, `.venv`, `venv`, `bower_components`, `.terraform` — are never descended into,
+- `*.worktrees` directories are skipped (worktrees are discovered separately),
+- a found repo is **not** descended into (no nested-repo scan).
+
+`--depth N` caps the descent (`--depth 1`, or `--no-recursive`, is the legacy single-level scan
+that only looks at immediate subdirectories). The list title shows a `scanning…` spinner with a
+running count while the walk is in flight.
+
+In the flat and grouped views each repo is shown by its **path relative to the scan root** (e.g.
+`personal/pull-all`), so repos with the same basename in different folders stay distinct.
+
+## The four view modes
+
+Tree and [grouping](../groups/) are **two independent toggles**, giving four combinations:
+
+| Mode | Toggle | What you see |
+|------|--------|--------------|
+| flat | (default) | every repo in one list, by relative path |
+| grouped | `v g` | repos in `groups.json` sections, regardless of folder |
+| tree | `v t` | the folder hierarchy, repos nested by basename |
+| tree + groups | `v g` + `v t` | groups subdivide the repos *inside each folder* |
+
+Both toggles persist across runs and also live in the settings modal (`,` → General). The tree
+toggle is inert (with a hint toast) when every repo sits at the scan root — a flat directory has
+no folders to nest.
+
+## Folder headers
+
+Each folder is a header row (`▾` expanded / `▸` collapsed) showing the folder name and a rollup
+of its **whole subtree**: running / updated / throttled / failed / skipped tallies and the total
+repo count. Repos nest one level beneath their folder. Selecting a folder header shows a summary
+(path, repo count, subfolders, status breakdown) in the preview pane.
+
+## Folding
+
+| Key | Action |
+|-----|--------|
+| `Enter` · `Space` · click | Toggle the selected folder/group header |
+| `←` | Collapse the selected header, or jump to the enclosing folder/group |
+| `→` | Expand a collapsed header |
+| `-` | Collapse **all** folders and groups |
+| `+` · `=` | Expand **all** |
+| `*` | Expand the selected subtree recursively |
+| `z` `a` | Toggle the selected header (vim `za`) |
+| `z` `o` / `z` `c` | Open / close the selected header (`zo` / `zc`) |
+| `z` `O` | Expand the selected subtree (`zO`, same as `*`) |
+| `z` `M` / `z` `R` | Collapse all / expand all (`zM` / `zR`) |
+
+The collapsed-folder set persists across runs. The fold hints (`←/→ fold · - / + all · *
+subtree`) appear in the status bar whenever a tree or groups are active, and are clickable.
