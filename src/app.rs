@@ -651,6 +651,17 @@ impl Background {
     }
 }
 
+/// What clicking an interactive element in the info block does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InfoAction {
+    /// Open a URL in the browser (clickable branch / commit / remote link).
+    OpenUrl(String),
+    /// Copy text to the clipboard (a `⧉` button or a value).
+    CopyText(String),
+    /// Expand/collapse a truncated field, keyed by its label (e.g. "Path").
+    ToggleExpand(String),
+}
+
 /// The semantic glyphs the UI renders, swappable between Unicode and emoji via `IconStyle`.
 /// Only the recognizable status/column/marker icons live here — git file-status letters,
 /// result-summary symbols, placeholders, and structural chars stay fixed.
@@ -1329,6 +1340,12 @@ pub struct AppState {
     pub right_view: RightView,
     /// Whether a compact info section is pinned above the log/diff (`I`).
     pub info_pinned: bool,
+    /// Clickable regions in the info block / log copy button: `(row, col_start, col_end, action)`.
+    /// Rebuilt every frame.
+    pub info_click: Vec<(u16, u16, u16, InfoAction)>,
+    /// Info-block field labels the user expanded (e.g. "Path", "Last commit") — show the full,
+    /// wrapped value instead of a left-truncated one. Session-only.
+    pub info_expanded: HashSet<String>,
     /// Whether the help modal (`?`) is open.
     pub show_help: bool,
     /// Which help tab is active (persisted so it reopens where you left it).
@@ -1506,6 +1523,8 @@ impl AppState {
             list_offset: 0,
             right_view: RightView::Log,
             info_pinned: persisted.info_pinned,
+            info_click: Vec::new(),
+            info_expanded: HashSet::new(),
             show_help: false,
             help_tab: persisted.help_tab,
             help_scroll: 0,
@@ -1826,6 +1845,21 @@ impl AppState {
             repo_page_columns: self.repo_page_columns,
             repo_page_info: self.repo_page_info,
         });
+    }
+
+    /// The info-block action at `(col,row)`, if any (mouse hit-test).
+    pub fn info_action_at(&self, col: u16, row: u16) -> Option<InfoAction> {
+        self.info_click
+            .iter()
+            .find(|(click_row, start, end, _)| *click_row == row && col >= *start && col < *end)
+            .map(|(_, _, _, action)| action.clone())
+    }
+
+    /// Expand or collapse a truncated info-block field by its label.
+    pub fn toggle_info_expanded(&mut self, field: &str) {
+        if !self.info_expanded.remove(field) {
+            self.info_expanded.insert(field.to_string());
+        }
     }
 
     /// The URL of a clickable help-modal link at the given screen row, if any.

@@ -48,7 +48,7 @@ export const keymap: KeymapSection[] = [
       { keys: ['R'], action: 'Retry all repos with an issue' },
       { keys: ['e'], action: 'Refetch selected repo', note: 're-pull regardless of status' },
       { keys: ['E'], action: 'Refetch all repos not in progress' },
-      { keys: ['i'], action: 'Toggle the info panel above the log/diff', note: 'additive block; tracks the selection' },
+      { keys: ['i'], action: 'Toggle the info panel above the log/diff', note: 'additive block; tracks the selection. Bold labels; empty rows hidden; clickable branch/commit/remote links; ⧉ copies the path (and the log, from the log pane); truncated path/subject expand on click', keywords: ['info', 'copy', 'link', 'expand', 'github'] },
       { keys: ['d'], action: 'Toggle the per-repo diff view' },
       { keys: ['t'], action: 'Column-toggle leader', note: 'then a/d/l/w/b/s; stays active until Esc. Zeros render dim; a column every repo lacks (no worktrees/stashes, ≤1 branch) auto-hides and its menu chip is dim/inert' },
       { keys: ['s'], action: 'Sort leader', note: 'then n/c/s/a/d/l/w/b/k → name/branch/status/ahead-behind/dirty/last/worktrees/branches/stashes; re-pick flips ▲▼ (or click a header); the status-bar ⟪column ▲⟫ tag is clickable too and flips direction. The list is always sorted — Name asc is the default', keywords: ['sort', 'order', 'ascending', 'descending', 'branch'] },

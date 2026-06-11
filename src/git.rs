@@ -45,10 +45,14 @@ fn looks_throttled(lower: &str) -> bool {
 /// `exit_success` — did the process exit with code 0?
 pub fn classify_pull_output(output: &str, exit_success: bool) -> PullOutcome {
     if !exit_success {
-        // A branch with no upstream isn't a failure — surface it as its own state.
+        // A branch with no upstream isn't a failure — surface it as its own state. The
+        // "no such ref was fetched" case is the same in spirit: the branch tracks a remote
+        // ref that no longer exists (its PR was merged and the branch deleted), so there's
+        // nothing to pull — gentler than a red failure on the Errors page.
         if output.contains("no tracking information")
             || output.contains("no upstream")
             || output.contains("There is no tracking information")
+            || output.contains("no such ref was fetched")
         {
             return PullOutcome::NoUpstream;
         }
@@ -1225,6 +1229,15 @@ mod tests {
     fn test_classify_no_upstream_is_not_failure() {
         let output = "There is no tracking information for the current branch.\n\
             Please specify which branch you want to merge with.\n";
+        assert_eq!(classify_pull_output(output, false), PullOutcome::NoUpstream);
+    }
+
+    #[test]
+    fn test_classify_deleted_upstream_ref_is_no_upstream() {
+        // The tracked remote branch was deleted (e.g. PR merged) — not a hard failure.
+        let output = "Your configuration specifies to merge with the ref \
+            'refs/heads/chore/FEP-61-remove-actions-doc-workflow'\n\
+            from the remote, but no such ref was fetched.\n";
         assert_eq!(classify_pull_output(output, false), PullOutcome::NoUpstream);
     }
 

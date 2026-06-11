@@ -11,7 +11,7 @@ Interactive multi-repo git pull dashboard. Pulls every git repo in a directory i
 - Parallel pulls with configurable concurrency (default: nproc); the list title shows live concurrency (`⇄ active/cap`)
 - Live log streaming per repo in a scrollable preview pane
 - Status glyphs: queued / running / up-to-date / updated / no-upstream / skipped / throttled / failed
-- Branches with no upstream are a distinct **no-upstream** state (`⊝`), not a failure — kept off the Errors page and counted as done
+- Branches with no upstream are a distinct **no-upstream** state (`⊝`), not a failure — kept off the Errors page and counted as done. A branch whose tracked remote ref was deleted (PR merged → "no such ref was fetched") is treated the same way, not as a red failure
 - **Throttle adaptation**: detects remote rate-limiting (HTTP 429 / "rate limit" / SSH connection throttling) as a distinct **throttled** state (`↯`), shows a warning banner, automatically halves concurrency, and re-queues throttled repos with exponential backoff — restoring full concurrency once the remote is quiet
 - Automatic one-shot retry of a failed pull before marking it failed
 - Dynamic `Errors (N)` page (after `Result`) listing each failed repo with its error output
@@ -144,7 +144,16 @@ The list always shows the status glyph + name + branch + a dirty marker (`•` f
 
 ### Info panel (`i`)
 
-`i` toggles an info block above the right pane's content (the pull log or the diff) for the selected repo: status + elapsed, branch, ahead/behind vs upstream, remote, last commit (hash · subject · author · relative date), worktrees, uncommitted/stash counts, and the local path. The block is additive — the log/diff stays beneath it — and tracks the selection as you move. The extra git facts are fetched lazily for the selected repo only. `c` starts claude code (`cc`, i.e. `claude --dangerously-skip-permissions`, in the repo dir; override with `PULL_CLAUDE_CMD`).
+`i` toggles an info block above the right pane's content (the pull log or the diff) for the selected repo: status (with how long the pull took), branch, ahead/behind, remote, last commit (hash · subject · author · relative date), worktrees, uncommitted/stash counts, and the local path. The block is additive — the log/diff stays beneath it — and tracks the selection as you move. The extra git facts are fetched lazily for the selected repo only.
+
+The panel is interactive (it's a web app in a terminal):
+
+- **Bold field labels**; rows that would carry nothing are hidden — no `↑0 ↓0`, no all-zero Changes line, no empty Worktrees.
+- **Clickable links** (when the remote is a browsable https host): the **branch** opens `…/tree/<branch>`, the **commit hash** opens `…/commit/<sha>`, and **Remote** opens the repo — all in your browser.
+- **Truncated values expand on click.** The path is truncated from the *left* (keeping the filename tail); a long commit subject from the right. Click the underlined value to expand it — the full text wraps starting at the value column, never under the label. Click again to collapse.
+- **Copy buttons**: a `⧉` next to **Path** copies the absolute path; a `⧉` on the log pane's top border copies the whole pull log.
+
+`c` starts claude code (`cc`, i.e. `claude --dangerously-skip-permissions`, in the repo dir; override with `PULL_CLAUDE_CMD`).
 
 ### Settings modal (`,`)
 
@@ -219,7 +228,7 @@ Everything actionable is clickable like a web page:
 
 ### New-build reload
 
-While running, pull-all watches its own binary on disk. When a newer build is installed (e.g. `make install`'s atomic rename), a persistent notice appears in the top-right (inset with the panel-padding setting, with a glint sweeping its border): `↺ new build installed · [reload] [x]`. `[reload]` restores the terminal and `exec`s the new binary with the same arguments — the fresh process re-scans and re-pulls (instant when everything is already up to date). `[x]` dismisses the notice; it re-arms if the binary changes again.
+While running, pull-all watches its own binary on disk. When a newer build is installed (e.g. `make install`'s atomic rename), a persistent notice appears in the top-right (inset with the panel-padding setting, with a glint sweeping its border): `↺ new build installed · [reload] [x]`. It rides on top of every screen — the repo list, the full-screen repo page, and any open modal — so it's never hidden. `[reload]` restores the terminal and `exec`s the new binary with the same arguments — the fresh process re-scans and re-pulls (instant when everything is already up to date). `[x]` dismisses the notice; it re-arms if the binary changes again.
 
 ## Testing
 

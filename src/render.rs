@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     AppState, ClickRegion, Column, ColumnFlags, Command, DiffFocus, DiffMode, DiffSource, HelpTab,
-    IconSet, Leader, ListRow, PageRow, PageRowKind, RepoPageColumn, RepoStatus, RightView,
-    ScrollHit, ScrollKind, SortColumn, SortDir, StatusFilter,
+    IconSet, InfoAction, Leader, ListRow, PageRow, PageRowKind, RepoPageColumn, RepoStatus,
+    RightView, ScrollHit, ScrollKind, SortColumn, SortDir, StatusFilter,
 };
 
 /// The published documentation site (opened by the `D` hotkey and linked in the help modal).
@@ -175,7 +175,6 @@ fn render_widgets(frame: &mut Frame, app: &mut AppState, tick: u64) {
     // The dedicated repo page is full-screen and replaces the normal layout.
     if app.repo_page.is_some() {
         render_repo_page(frame, app, area, tick);
-        render_update_notice(frame, app, area, tick);
         render_throttle_banner(frame, app, area);
         if app.confirm.is_some() {
             render_confirm(frame, app, area);
@@ -193,6 +192,8 @@ fn render_widgets(frame: &mut Frame, app: &mut AppState, tick: u64) {
         if app.show_help {
             render_help(frame, app, area);
         }
+        // The new-build notice and transient toast sit on top of everything, on every screen.
+        render_update_notice(frame, app, area, tick);
         render_toast(frame, app, area);
         return;
     }
@@ -236,8 +237,6 @@ fn render_widgets(frame: &mut Frame, app: &mut AppState, tick: u64) {
     // Draw the draggable divider grip (and a live highlight while it's being dragged).
     render_divider(frame, app);
 
-    // New-build notice (top-right), beneath the modals.
-    render_update_notice(frame, app, area, tick);
     // Throttle warning (top-center) while a remote is rate-limiting us.
     render_throttle_banner(frame, app, area);
 
@@ -253,7 +252,8 @@ fn render_widgets(frame: &mut Frame, app: &mut AppState, tick: u64) {
     if app.show_settings {
         render_settings(frame, app, area);
     }
-    // Transient toast on top of everything.
+    // The new-build notice (top-right) and transient toast sit on top of everything.
+    render_update_notice(frame, app, area, tick);
     render_toast(frame, app, area);
 }
 
@@ -1018,28 +1018,24 @@ fn render_preview(frame: &mut Frame, app: &mut AppState, area: Rect, _tick: u64)
         _ => None,
     };
 
+    // Clickable info-block regions are rebuilt each frame (and only the main view captures them).
+    app.info_click.clear();
+
     // Info block (`i`): a compact info section above the log/diff, tracking the selection.
     let area = if let (true, Some(repo_idx)) = (app.info_pinned, selected_repo) {
         let name = app.repos[repo_idx].lock().unwrap().name.clone();
         let info_width = area.width.saturating_sub(if app.panel_padding { 4 } else { 2 }) as usize;
-        let lines = build_info_lines(app, repo_idx, info_width);
+        let (lines, clicks) = build_info_lines(app, repo_idx, info_width);
         // +2 for the border, +2 more for inner padding when the setting is on.
         let chrome = if app.panel_padding { 4 } else { 2 };
-        // Count wrapped rows, not logical lines: a long field (Changes, Remote, Path) wraps to
-        // several rows, so sizing by `lines.len()` would clip the tail (Worktrees / Path).
-        let wrap_width = info_width.max(1);
-        let wrapped_rows: usize = lines
-            .iter()
-            .map(|line| line.width().max(1).div_ceil(wrap_width))
-            .sum();
-        // Grow the block to fit its content; only cap it so the log/diff beneath keeps a few rows.
+        // Lines are pre-wrapped, so one logical line is one row.
         let max_info = area.height.saturating_sub(3).max(3);
-        let desired = (wrapped_rows as u16 + chrome).clamp(3, max_info);
+        let desired = (lines.len() as u16 + chrome).clamp(3, max_info);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(desired), Constraint::Min(0)])
             .split(area);
-        render_info_block(frame, app, chunks[0], format!(" {name} · info "), lines);
+        render_info_block(frame, app, chunks[0], format!(" {name} · info "), lines, clicks);
         chunks[1]
     } else {
         area
@@ -1101,6 +1097,30 @@ fn render_preview(frame: &mut Frame, app: &mut AppState, area: Rect, _tick: u64)
         .border_type(BorderType::Rounded)
         .padding(panel_pad(app))
         .border_style(pane_border_style(app.preview_focused));
+
+    // A `⧉` copy button on the top border copies the whole log when a repo's log is showing.
+    let showing_repo_log = selected_repo.is_some()
+        && !overlay
+        && selected_group.is_none()
+        && selected_folder.is_none();
+    if showing_repo_log && !content_lines.is_empty() {
+        let glyph = "⧉";
+        let col_end = area.x + area.width.saturating_sub(2);
+        let col_start = col_end.saturating_sub(UnicodeWidthStr::width(glyph) as u16);
+        block = block.title_top(
+            Line::from(Span::styled(
+                glyph,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+        app.info_click.push((
+            area.y,
+            col_start,
+            col_end,
+            InfoAction::CopyText(content_lines.join("\n")),
+        ));
+    }
 
     // Group view: the key hints live in the pane chrome as styled, CLICKABLE segments (same
     // machinery as the status bar), not as plain content text.
@@ -1183,106 +1203,243 @@ fn render_preview(frame: &mut Frame, app: &mut AppState, area: Rect, _tick: u64)
 /// worktrees, changes, path) plus a command-hint footer, for the selected repo.
 /// Build the per-repo info content lines (status, branch, ahead/behind, commit, changes,
 /// remote, worktrees, path) — shared by the full info view and the pinned info section.
-fn build_info_lines(app: &AppState, repo_idx: usize, content_width: usize) -> Vec<Line<'static>> {
+/// A browsable https base for a remote URL (strips a trailing `.git`), or None for non-web remotes.
+fn web_remote(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches('/');
+    let base = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    base.starts_with("https://").then(|| base.to_string())
+}
+
+/// Split `text` into chunks of at most `width` display columns, on char boundaries.
+fn wrap_chars(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for ch in text.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if current_width + char_width > width && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += char_width;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// The info block's wrapped display lines plus the clickable regions inside them
+/// (`(line_index, start_col, end_col, action)`, columns relative to the inner content origin).
+type InfoClick = (usize, u16, u16, InfoAction);
+
+fn build_info_lines(
+    app: &AppState,
+    repo_idx: usize,
+    content_width: usize,
+) -> (Vec<Line<'static>>, Vec<InfoClick>) {
     let state = app.repos[repo_idx].lock().unwrap();
 
-    let label = Style::default().fg(Color::DarkGray);
+    const LABEL_W: usize = 13;
+    let label = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
     let value = Style::default().fg(Color::Gray);
-    let link = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::UNDERLINED);
+    let dim = Style::default().fg(Color::DarkGray);
+    let link = Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+    let value_width = content_width.saturating_sub(LABEL_W).max(1);
 
-    let field = |name: &str, text: String| {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut clicks: Vec<InfoClick> = Vec::new();
+
+    let plain = |name: &str, text: String| {
         Line::from(vec![
             Span::styled(format!("{name:<13}"), label),
             Span::styled(text, value),
         ])
     };
 
-    let elapsed_str = match state.elapsed {
-        Some(elapsed) => format!("{:.2}s", elapsed.as_secs_f64()),
-        None => "—".to_string(),
+    // Status — spell out what the duration means (how long the pull/fetch took).
+    let status_value = match state.elapsed {
+        Some(elapsed) => {
+            format!("{} · pull took {:.2}s", status_label(&state.status), elapsed.as_secs_f64())
+        }
+        None => status_label(&state.status).to_string(),
     };
+    lines.push(plain("Status", status_value));
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(field(
-        "Status",
-        format!("{} · {elapsed_str}", status_label(&state.status)),
-    ));
-    lines.push(field(
-        "Branch",
-        state.branch.clone().unwrap_or_else(|| "—".to_string()),
-    ));
+    // Branch — clickable to its page on the remote when the remote is browsable.
+    let branch = state.branch.clone().unwrap_or_else(|| "—".to_string());
+    let branch_link = (branch != "—")
+        .then(|| state.remote_url.as_deref())
+        .flatten()
+        .and_then(web_remote)
+        .map(|base| format!("{base}/tree/{branch}"));
+    match branch_link {
+        Some(url) => {
+            let width = UnicodeWidthStr::width(branch.as_str()) as u16;
+            clicks.push((lines.len(), LABEL_W as u16, LABEL_W as u16 + width, InfoAction::OpenUrl(url)));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<13}", "Branch"), label),
+                Span::styled(branch, link),
+            ]));
+        }
+        None => lines.push(plain("Branch", branch)),
+    }
 
     if let Some(details) = &state.details {
-        let ahead_behind = match (details.ahead, details.behind) {
-            (Some(ahead), Some(behind)) => format!("↑{ahead}  ↓{behind}"),
-            _ => "(no upstream)".to_string(),
-        };
-        lines.push(field("Ahead/behind", ahead_behind));
-        if details.commit_hash.is_empty() {
-            lines.push(field("Last commit", "—".to_string()));
-        } else {
-            // Three tidy rows — hash, subject, then (date, author) — each starting at the value
-            // column and truncated so a long subject never wraps back to the label column.
-            let value_width = content_width.saturating_sub(13).max(1);
-            lines.push(field("Last commit", details.commit_hash.clone()));
+        // Ahead/behind — hidden when there's nothing to report (both zero, or no upstream).
+        if let (Some(ahead), Some(behind)) = (details.ahead, details.behind) {
+            if ahead > 0 || behind > 0 {
+                lines.push(plain("Ahead/behind", format!("↑{ahead}  ↓{behind}")));
+            }
+        }
+        // Last commit — sha clickable to the commit on the remote, then subject (expandable) + meta.
+        if !details.commit_hash.is_empty() {
+            let sha = details.commit_hash.clone();
+            let commit_link = state
+                .remote_url
+                .as_deref()
+                .and_then(web_remote)
+                .map(|base| format!("{base}/commit/{sha}"));
+            match commit_link {
+                Some(url) => {
+                    let width = UnicodeWidthStr::width(sha.as_str()) as u16;
+                    clicks.push((lines.len(), LABEL_W as u16, LABEL_W as u16 + width, InfoAction::OpenUrl(url)));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<13}", "Last commit"), label),
+                        Span::styled(sha, link),
+                    ]));
+                }
+                None => lines.push(plain("Last commit", sha)),
+            }
+            // Subject: one truncated line (click to expand + wrap), or fully wrapped when expanded.
+            let expanded = app.info_expanded.contains("commit");
+            let subject_overflows = UnicodeWidthStr::width(details.commit_subject.as_str()) > value_width;
+            if expanded && subject_overflows {
+                for chunk in wrap_chars(&details.commit_subject, value_width) {
+                    let width = UnicodeWidthStr::width(chunk.as_str()) as u16;
+                    clicks.push((lines.len(), LABEL_W as u16, LABEL_W as u16 + width, InfoAction::ToggleExpand("commit".into())));
+                    lines.push(Line::from(vec![
+                        Span::raw(format!("{:<13}", "")),
+                        Span::styled(chunk, value),
+                    ]));
+                }
+            } else {
+                let shown = truncate_str(&details.commit_subject, value_width);
+                let subject_style = if subject_overflows { value.add_modifier(Modifier::UNDERLINED) } else { value };
+                if subject_overflows {
+                    let width = UnicodeWidthStr::width(shown.as_str()) as u16;
+                    clicks.push((lines.len(), LABEL_W as u16, LABEL_W as u16 + width, InfoAction::ToggleExpand("commit".into())));
+                }
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{:<13}", "")),
+                    Span::styled(shown, subject_style),
+                ]));
+            }
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<13}", ""), label),
-                Span::styled(truncate_str(&details.commit_subject, value_width), value),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:<13}", ""), label),
+                Span::raw(format!("{:<13}", "")),
                 Span::styled(
                     truncate_str(
                         &format!("({}, {})", details.commit_rel_date, details.commit_author),
                         value_width,
                     ),
-                    label,
+                    dim,
                 ),
             ]));
         }
-        lines.push(field(
-            "Changes",
-            format!(
-                "{} uncommitted · {} stashed · {} feature branches",
-                details.dirty_count, details.stash_count, details.branch_count
-            ),
-        ));
+        // Changes — hidden when everything is zero.
+        if details.dirty_count > 0 || details.stash_count > 0 || details.branch_count > 0 {
+            lines.push(plain(
+                "Changes",
+                format!(
+                    "{} uncommitted · {} stashed · {} feature branches",
+                    details.dirty_count, details.stash_count, details.branch_count
+                ),
+            ));
+        }
     } else {
-        lines.push(field("Ahead/behind", "(loading…)".to_string()));
-        lines.push(field("Last commit", "(loading…)".to_string()));
-        lines.push(field("Changes", "(loading…)".to_string()));
+        lines.push(plain("Ahead/behind", "(loading…)".to_string()));
+        lines.push(plain("Last commit", "(loading…)".to_string()));
     }
 
-    match &state.remote_url {
-        Some(url) => lines.push(Line::from(vec![
+    if let Some(url) = &state.remote_url {
+        let width = UnicodeWidthStr::width(url.as_str()) as u16;
+        clicks.push((lines.len(), LABEL_W as u16, LABEL_W as u16 + width, InfoAction::OpenUrl(url.clone())));
+        lines.push(Line::from(vec![
             Span::styled(format!("{:<13}", "Remote"), label),
             Span::styled(url.clone(), link),
-        ])),
-        None => lines.push(field("Remote", "(none)".to_string())),
+        ]));
     }
 
+    // Worktrees — hidden when there are none.
     let worktrees: Vec<String> = app
         .worktrees
         .iter()
         .filter(|entry| entry.repo == state.name)
         .map(|entry| entry.branch.clone())
         .collect();
-    lines.push(field(
-        "Worktrees",
-        if worktrees.is_empty() {
-            "—".to_string()
+    if !worktrees.is_empty() {
+        lines.push(plain("Worktrees", worktrees.join(", ")));
+    }
+
+    // Path — a `⧉` copy button next to the label, the value left-truncated (click to expand +
+    // wrap from the value column). Keeps the filename tail visible.
+    let path = state.path.display().to_string();
+    let copy_col = (LABEL_W - 2) as u16;
+    let label_with_copy = |line_idx: usize, clicks: &mut Vec<InfoClick>| -> Vec<Span<'static>> {
+        clicks.push((line_idx, copy_col, copy_col + 1, InfoAction::CopyText(path.clone())));
+        vec![
+            Span::styled("Path".to_string(), label),
+            Span::raw(" ".repeat(copy_col as usize - 4)),
+            Span::styled("⧉".to_string(), link),
+            Span::raw(" "),
+        ]
+    };
+    let path_expanded = app.info_expanded.contains("Path");
+    let path_overflows = UnicodeWidthStr::width(path.as_str()) > value_width;
+    if path_expanded && path_overflows {
+        for (index, chunk) in wrap_chars(&path, value_width).into_iter().enumerate() {
+            let line_idx = lines.len();
+            let width = UnicodeWidthStr::width(chunk.as_str()) as u16;
+            clicks.push((line_idx, LABEL_W as u16, LABEL_W as u16 + width, InfoAction::ToggleExpand("Path".into())));
+            let mut spans = if index == 0 {
+                label_with_copy(line_idx, &mut clicks)
+            } else {
+                vec![Span::raw(format!("{:<13}", ""))]
+            };
+            spans.push(Span::styled(chunk, value));
+            lines.push(Line::from(spans));
+        }
+    } else {
+        let line_idx = lines.len();
+        let mut spans = label_with_copy(line_idx, &mut clicks);
+        if path_overflows {
+            let shown = truncate_left(&path, value_width);
+            let width = UnicodeWidthStr::width(shown.as_str()) as u16;
+            clicks.push((line_idx, LABEL_W as u16, LABEL_W as u16 + width, InfoAction::ToggleExpand("Path".into())));
+            spans.push(Span::styled(shown, value.add_modifier(Modifier::UNDERLINED)));
         } else {
-            worktrees.join(", ")
-        },
-    ));
-    lines.push(field("Path", state.path.display().to_string()));
-    lines
+            spans.push(Span::styled(path.clone(), value));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    (lines, clicks)
 }
 
-/// Render an info block (border + lines + scrollbar) into `area`.
-fn render_info_block(frame: &mut Frame, app: &AppState, area: Rect, title: String, lines: Vec<Line<'static>>) {
+/// Render an info block (border + pre-wrapped lines + scrollbar) into `area`, and translate each
+/// clickable region's in-line columns into absolute screen rects on `app.info_click`.
+fn render_info_block(
+    frame: &mut Frame,
+    app: &mut AppState,
+    area: Rect,
+    title: String,
+    lines: Vec<Line<'static>>,
+    clicks: Vec<InfoClick>,
+) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -1292,8 +1449,20 @@ fn render_info_block(frame: &mut Frame, app: &AppState, area: Rect, title: Strin
     let inner = block.inner(area);
     let total = lines.len();
     frame.render_widget(block, area);
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    // Lines are already wrapped to the inner width, so render them verbatim (no Paragraph wrap)
+    // — that keeps line N at row inner.y + N, which the click translation below relies on.
+    let visible = (inner.height as usize).min(lines.len());
+    frame.render_widget(Paragraph::new(lines), inner);
+    for (line_idx, start, end, action) in clicks {
+        if line_idx < visible {
+            app.info_click.push((
+                inner.y + line_idx as u16,
+                inner.x + start,
+                inner.x + end,
+                action,
+            ));
+        }
+    }
     render_scrollbar(frame, scrollbar_track(area, inner), 0, total, inner.height as usize, false);
 }
 

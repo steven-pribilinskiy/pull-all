@@ -32,7 +32,7 @@ use ratatui::Terminal;
 
 use app::{
     point_in, region_hit, AppState, Column, Command as Cmd, ConfirmAction, ConfirmDialog,
-    DiffFocus, DiffSource, Leader, PageRow, PageRowKind, RepoPageColumn, RepoStatus,
+    DiffFocus, DiffSource, InfoAction, Leader, PageRow, PageRowKind, RepoPageColumn, RepoStatus,
     RightView, SharedRepoState, SortColumn, StatusFilter,
 };
 use worker::{
@@ -1127,6 +1127,13 @@ async fn run_event_loop(
                         } else if let Some(column) = app.header_sort_at(mouse.column, mouse.row) {
                             // Click a column header to sort by it (re-click flips direction).
                             app.set_sort(column);
+                        } else if let Some(action) = app.info_action_at(mouse.column, mouse.row) {
+                            // Click an info-block link / copy button / expandable value.
+                            match action {
+                                InfoAction::OpenUrl(url) => open_url(&url),
+                                InfoAction::CopyText(text) => copy_to_clipboard(&text),
+                                InfoAction::ToggleExpand(field) => app.toggle_info_expanded(&field),
+                            }
                         } else {
                             let on_divider = (i32::from(mouse.column)
                                 - i32::from(app.divider_col))
