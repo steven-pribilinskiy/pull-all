@@ -452,6 +452,9 @@ fn dispatch_command(
             app.show_settings = true;
             app.settings_selected = 0;
         }
+        Cmd::ShowBuildInfo => {
+            app.show_build_info = true;
+        }
         Cmd::Quit => {
             return Some(if app.all_done {
                 let failed = app
@@ -903,6 +906,14 @@ async fn run_event_loop(
                     }
                 }
 
+                // Build-info modal: informational — any click dismisses it (and is swallowed).
+                if app.show_build_info {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.show_build_info = false;
+                    }
+                    continue;
+                }
+
                 // Settings modal: click a row label to select it, a radio chip to set that
                 // value, [x] or anywhere outside to close. Everything else is swallowed so
                 // clicks never fall through to the view behind.
@@ -1258,6 +1269,18 @@ async fn run_event_loop(
                         }
                         _ => {}
                     }
+                    continue;
+                }
+
+                // Build-info modal: informational — Ctrl-C quits, any other key dismisses it.
+                if app.show_build_info {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        drop(app);
+                        return Ok(130);
+                    }
+                    app.show_build_info = false;
                     continue;
                 }
 

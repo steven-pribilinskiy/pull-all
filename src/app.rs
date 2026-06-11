@@ -819,6 +819,8 @@ pub enum Command {
     /// Copy the selected repo's remote URL (same as `Y`).
     CopyRemote,
     Settings,
+    /// Open the build-info modal (the clickable "built … ago" status-bar tag).
+    ShowBuildInfo,
     Quit,
 }
 
@@ -1455,6 +1457,12 @@ pub struct AppState {
     pub update_close_click: Option<(u16, u16, u16)>,
     /// When the running binary was built (its mtime at startup) — shown as "built … ago".
     pub binary_built: Option<std::time::SystemTime>,
+    /// The watched executable path (resolved at startup) — shown in the build-info modal.
+    pub exe_path: String,
+    /// Whether the build-info modal (the clickable "built … ago" tag) is open.
+    pub show_build_info: bool,
+    /// The build-info modal's `[x]` close button region.
+    pub build_info_close_click: Option<(u16, u16, u16)>,
     // Grouping (`z`, groups from ~/.config/pull-all/groups.json):
     /// Render the list grouped (`z` toggles; persisted). Inert while `groups` is empty.
     pub grouping_enabled: bool,
@@ -1587,6 +1595,11 @@ impl AppState {
                 .ok()
                 .and_then(|exe| std::fs::metadata(exe).ok())
                 .and_then(|meta| meta.modified().ok()),
+            exe_path: std::env::current_exe()
+                .map(|exe| exe.display().to_string())
+                .unwrap_or_else(|_| "pull-all".to_string()),
+            show_build_info: false,
+            build_info_close_click: None,
             grouping_enabled: persisted.grouping_enabled,
             groups: Vec::new(),
             repo_group_map: Vec::new(),

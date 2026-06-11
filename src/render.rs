@@ -185,6 +185,9 @@ fn render_widgets(frame: &mut Frame, app: &mut AppState, tick: u64) {
         if app.show_settings {
             render_settings(frame, app, area);
         }
+        if app.show_build_info {
+            render_build_info(frame, app, area);
+        }
         if app.copy_menu.is_some() {
             render_copy_menu(frame, app, area);
         }
@@ -251,6 +254,9 @@ fn render_widgets(frame: &mut Frame, app: &mut AppState, tick: u64) {
     // Settings modal overlays everything.
     if app.show_settings {
         render_settings(frame, app, area);
+    }
+    if app.show_build_info {
+        render_build_info(frame, app, area);
     }
     // The new-build notice (top-right) and transient toast sit on top of everything.
     render_update_notice(frame, app, area, tick);
@@ -2001,7 +2007,11 @@ fn render_status_bar(frame: &mut Frame, app: &mut AppState, area: Rect) {
         .binary_built
         .and_then(|built| built.elapsed().ok())
         .map(|age| {
-            vec![(format!("built {}", crate::app::format_ago(age.as_secs())), hint, None)]
+            vec![(
+                format!("built {}", crate::app::format_ago(age.as_secs())),
+                hint,
+                Some(Command::ShowBuildInfo),
+            )]
         })
         .unwrap_or_default();
     let right_meta: Vec<(String, Style, Option<Command>)> = vec![
@@ -3690,6 +3700,76 @@ fn render_repo_page(frame: &mut Frame, app: &mut AppState, area: Rect, tick: u64
 }
 
 /// Render the yes/no confirmation dialog (keyboard-driven: y / n / Esc).
+/// Render the build-info modal (opened by clicking the "built … ago" status tag): the running
+/// version, the watched executable path, when it was built, and how new-build watching works.
+fn render_build_info(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    let built = app
+        .binary_built
+        .and_then(|built| built.elapsed().ok())
+        .map(|age| crate::app::format_ago(age.as_secs()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let label = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let value = Style::default().fg(Color::Gray);
+    let dim = Style::default().fg(Color::DarkGray);
+    let field = |name: &str, text: String| {
+        Line::from(vec![
+            Span::styled(format!("{name:<9}"), label),
+            Span::styled(text, value),
+        ])
+    };
+
+    let mut lines: Vec<Line> = vec![
+        field("Version", concat!("v", env!("CARGO_PKG_VERSION")).to_string()),
+        field("Built", built),
+        field("Path", app.exe_path.clone()),
+        Line::from(String::new()),
+        Line::from(Span::styled("Watching this file for new builds", label)),
+        Line::from(Span::styled(
+            "pull-all polls this executable's size + mtime every few seconds. When a newer",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "build lands at the same path (e.g. make install's atomic rename), a ↺ [reload]",
+            dim,
+        )),
+        Line::from(Span::styled("notice appears top-right on every screen.", dim)),
+        Line::from(String::new()),
+    ];
+    let status = if app.update_available && !app.update_dismissed {
+        Span::styled(
+            "● A new build is available — click [reload] to restart.",
+            Style::default().fg(Color::Yellow),
+        )
+    } else if app.update_dismissed {
+        Span::styled("○ A new build was dismissed; it re-arms if the file changes.", dim)
+    } else {
+        Span::styled("✓ Running the latest build on disk.", Style::default().fg(Color::Green))
+    };
+    lines.push(Line::from(status));
+
+    let pad = if app.panel_padding { 2 } else { 0 };
+    let content_width = lines.iter().map(|line| line.width()).max().unwrap_or(40) as u16 + 4 + pad;
+    let width = content_width.clamp(40, area.width.saturating_sub(4).max(40));
+    // Allow two extra rows in case a long path wraps.
+    let height = (lines.len() as u16 + 4 + pad).min(area.height.saturating_sub(2).max(8));
+    let modal = centered_rect(width, height, area);
+    let (close_line, close_click) = modal_close_button(modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(panel_pad(app))
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Build info ")
+        .title_top(close_line)
+        .title_bottom(Line::from(" esc / click closes ").right_aligned());
+    let inner = block.inner(modal);
+    cast_shadow(frame, modal);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(block, modal);
+    app.build_info_close_click = close_click;
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn render_confirm(frame: &mut Frame, app: &mut AppState, area: Rect) {
     let Some(confirm) = &app.confirm else {
         return;

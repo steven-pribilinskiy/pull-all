@@ -219,7 +219,7 @@ suspended until you quit (same tradeoff as lazygit/htop).
 
 Everything actionable is clickable like a web page:
 
-- **Status-bar hints** — the whole hint ("s sort", "f by-status", "/ filter", …), not just the key. The active tags sit next to their hints and are clickable too: `⟪name ▲⟫` flips the sort direction, `[needle]` clears the name filter, `{failed}` resets the status filter. In "[ ] resize", `[` and `]` nudge the split directly. The right side shows the version, when the binary was built, and clickable `, settings · ? help · q quit`.
+- **Status-bar hints** — the whole hint ("s sort", "f by-status", "/ filter", …), not just the key. The active tags sit next to their hints and are clickable too: `⟪name ▲⟫` flips the sort direction, `[needle]` clears the name filter, `{failed}` resets the status filter. In "[ ] resize", `[` and `]` nudge the split directly. The right side shows the version, a clickable `built … ago` tag (opens the Build info modal), and clickable `, settings · ? help · q quit`.
 - **Modals** (settings, copy menu, confirm, diff, help) — every modal has an `[x]` close button on its top border and closes/cancels when you click anywhere outside it. Clicks inside a modal never fall through to the view behind.
 - **Settings** — click a row label to select it, or click a radio chip (`● dark`, `○ off`, …) to set that exact value.
 - **Confirm dialogs** — `[y/enter] yes` and `[n] no` are clickable.
@@ -229,6 +229,8 @@ Everything actionable is clickable like a web page:
 ### New-build reload
 
 While running, pull-all watches its own binary on disk. When a newer build is installed (e.g. `make install`'s atomic rename), a persistent notice appears in the top-right (inset with the panel-padding setting, with a glint sweeping its border): `↺ new build installed · [reload] [x]`. It rides on top of every screen — the repo list, the full-screen repo page, and any open modal — so it's never hidden. `[reload]` restores the terminal and `exec`s the new binary with the same arguments — the fresh process re-scans and re-pulls (instant when everything is already up to date). `[x]` dismisses the notice; it re-arms if the binary changes again.
+
+Clicking the **`built … ago`** tag in the status bar opens a **Build info** modal: the running version, the watched executable path, when it was built, how the new-build watch works, and whether a newer build is currently waiting. Any key or click closes it.
 
 ## Testing
 
