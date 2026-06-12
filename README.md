@@ -10,10 +10,10 @@ Interactive multi-repo git pull dashboard. Pulls every git repo in a directory i
 - **Directory-tree view** (`v t`): render the repos as a collapsible folder tree, with per-folder status rollups; orthogonal to grouping, so you can have flat, grouped, tree, or **tree + groups** (groups subdivide repos inside each folder)
 - Parallel pulls with configurable concurrency (default: nproc); the list title shows live concurrency (`⇄ active/cap`)
 - Live log streaming per repo in a scrollable preview pane
-- Status glyphs: queued / running / up-to-date / updated / no-upstream / skipped / throttled / failed
+- Status glyphs: queued / running / up-to-date / updated / no-upstream / skipped / throttled / failed — plus an optional **status text column** (`t u`) that spells them out and names the failure kind on failed repos (`not found` / `auth` / `diverged` / `not a repo` / `timeout` / `network` / `lock`)
 - Branches with no upstream are a distinct **no-upstream** state (`⊝`), not a failure — kept off the Errors page and counted as done. A branch whose tracked remote ref was deleted (PR merged → "no such ref was fetched") is treated the same way, not as a red failure
 - **Throttle adaptation**: detects remote rate-limiting (HTTP 429 / "rate limit" / SSH connection throttling) as a distinct **throttled** state (`↯`), shows a warning banner, automatically halves concurrency, and re-queues throttled repos with exponential backoff — restoring full concurrency once the remote is quiet
-- Automatic one-shot retry of a failed pull before marking it failed
+- Automatic one-shot retry of a failed pull before marking it failed — skipped for permanent errors (repository not found, auth failure, diverged branch) where retrying can't change the result
 - Dynamic `Errors (N)` page (after `Result`) listing each failed repo with its error output
 - Retry repos with an issue (`r` / `R`) and refetch any repo from scratch (`e` / `E`) — a refetch re-pulls **and** refreshes every cached fact (branch/dirty/stash counts, ahead/behind, worktrees)
 - Action hints dim when they'd be a no-op
@@ -111,11 +111,11 @@ The `cli` backend (`pull-all-repos`, the original parallel-pull bash script that
 | `E` | Refetch all repos that aren't currently in progress |
 | `i` | Toggle the info panel — an additive block above the log/diff (status, branch, ahead/behind, remote, last commit, worktrees, changes, path) |
 | `d` | Toggle the per-repo diff view (working-tree changes, or the last pull's diff) |
-| `t` | Column-toggle leader: press `t` then `a`/`d`/`l`/`w`/`b`/`s` to show/hide a column (mode stays active until `Esc`) |
+| `t` | Column-toggle leader: press `t` then `u`/`a`/`d`/`l`/`w`/`b`/`s` to show/hide a column (mode stays active until `Esc`) |
 | `s` | Sort leader: press `s` then `n`/`c`/`s`/`a`/`d`/`l`/`w`/`b`/`k` to sort by name / branch / status / ahead-behind / dirty / last-commit / worktrees / branches / stashes — re-pick flips `▲`/`▼` (or click a column header); the list is always sorted (Name asc by default) |
 | `f` | Status-filter leader: press `f` then `a`/`u`/`c`/`s`/`f`/`i` to filter the list by all / updated / up-to-date / skipped / failed / issues (applies on top of `/`) |
 | `o` | Open the selected repo's remote in the browser |
-| `y` | Copy the selected repo's **absolute path** to the clipboard |
+| `y` | Copy the selected repo's **absolute path** to the clipboard (every copy confirms with a toast previewing the copied text) |
 | `Y` | Copy the selected repo's **remote (origin) URL** to the clipboard |
 | `c` | Start claude code in the selected repo (suspends the TUI, returns on exit) |
 | `l` | Open **lazygit** in the selected repo (suspends the TUI, returns on exit) |
@@ -140,7 +140,7 @@ Opens a full-screen page for the selected repo that runs `git fetch` and lists e
 
 ### Columns (`t` leader)
 
-The list always shows the status glyph + name + branch + a dirty marker (an amber `•` for any repo with uncommitted changes — amber, not red, since it's a "modified" state, not an error). Press `t` then a column key to toggle extra columns: `a` ahead/behind, `d` adds the dirty **count** (`•N`) to the always-on marker, `l` last-commit age, `w` worktree count (`⑃N`, cyan), `b` feature-branch count (`⑂N`, green — local branches excluding `main`/`dev`), `s` stash count (`≡N`). Count columns render a **dim zero** rather than a blank, so the column shape stays recognizable. A column every repo leaves empty (no worktrees, no stashes, or ≤1 branch everywhere) auto-hides once its data has loaded, and its `t`-menu chip goes dim and inert. The git-derived columns fetch per-repo details in the background the first time one is enabled (cells show `…` until ready); `w` is free from worktree discovery. Enabled columns persist across runs.
+The list always shows the status glyph + name + branch + a dirty marker (an amber `•` for any repo with uncommitted changes — amber, not red, since it's a "modified" state, not an error). Press `t` then a column key to toggle extra columns: `u` status text (a short label per state — `queued`/`running`/`up-to-date`/`updated`/`no upstream`/`dirty`/`throttled` — with the specific failure kind on failed repos: `not found`, `auth`, `diverged`, `not a repo`, `timeout`, `network`, `lock`, and `ref gone` for a deleted upstream ref), `a` ahead/behind, `d` adds the dirty **count** (`•N`) to the always-on marker, `l` last-commit age, `w` worktree count (`⑃N`, cyan), `b` feature-branch count (`⑂N`, green — local branches excluding `main`/`dev`), `s` stash count (`≡N`). Count columns render a **dim zero** rather than a blank, so the column shape stays recognizable. A column every repo leaves empty (no worktrees, no stashes, or ≤1 branch everywhere) auto-hides once its data has loaded, and its `t`-menu chip goes dim and inert. The git-derived columns fetch per-repo details in the background the first time one is enabled (cells show `…` until ready); `w` is free from worktree discovery. Enabled columns persist across runs.
 
 ### Info panel (`i`)
 

@@ -363,6 +363,7 @@ impl PageRow {
 /// An optional list column the user can toggle on via the `t` leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
+    Status,
     AheadBehind,
     Dirty,
     LastCommit,
@@ -376,6 +377,7 @@ pub enum Column {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ColumnFlags {
+    pub status: bool,
     pub ahead_behind: bool,
     pub dirty: bool,
     pub last_commit: bool,
@@ -952,6 +954,10 @@ pub struct RepoState {
     /// Browsable https URL of the `origin` remote, discovered asynchronously.
     pub remote_url: Option<String>,
     pub status: RepoStatus,
+    /// Short qualifier for the status column: the failure kind for a failed pull ("not found",
+    /// "auth", "diverged", …) or "ref gone" for a deleted-upstream no-upstream. Cleared at the
+    /// start of every pull.
+    pub status_note: Option<&'static str>,
     /// Log ring buffer (stdout + stderr from git pull).
     pub log: LogBuffer,
     /// Whether the preview pane should auto-scroll to bottom.
@@ -1020,6 +1026,7 @@ impl RepoState {
             branch: None,
             remote_url: None,
             status: RepoStatus::Queued,
+            status_note: None,
             log: LogBuffer::default(),
             auto_scroll: true,
             preview_scroll: 0,
@@ -1335,6 +1342,30 @@ impl GroupRuntime {
     }
 }
 
+/// A transient toast: a headline plus optional dimmed preview lines (e.g. the start of
+/// just-copied clipboard text). Auto-dismisses after `AppState::TOAST_DURATION`.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub message: String,
+    pub preview: Vec<String>,
+    pub shown_at: Instant,
+}
+
+/// The first `COPY_PREVIEW_LINES` lines of `copied` for a copy-confirmation toast, with a
+/// trailing "+N more lines" marker when the text is longer.
+pub fn copy_preview(copied: &str) -> Vec<String> {
+    let total = copied.lines().count();
+    let mut preview: Vec<String> = copied
+        .lines()
+        .take(AppState::COPY_PREVIEW_LINES)
+        .map(str::to_string)
+        .collect();
+    if total > AppState::COPY_PREVIEW_LINES {
+        preview.push(format!("… +{} more lines", total - AppState::COPY_PREVIEW_LINES));
+    }
+    preview
+}
+
 /// The overall application state, shared between the async worker tasks and the UI.
 pub struct AppState {
     /// Repos in alphabetical order.
@@ -1481,8 +1512,8 @@ pub struct AppState {
     pub settings_selected: usize,
     /// The repo-page `y` copy menu, when open: the selected option (0 = path, 1 = branch, 2 = both).
     pub copy_menu: Option<usize>,
-    /// A transient toast message + when it was shown (auto-dismisses after `TOAST_DURATION`).
-    pub toast: Option<(String, Instant)>,
+    /// A transient toast (auto-dismisses after `TOAST_DURATION`).
+    pub toast: Option<Toast>,
     // Modal mouse geometry — captured each render (same pattern as `help_close_click`).
     // Close buttons are `(row, col_start, col_end)`; areas drive click-outside-closes.
     pub settings_area: Rect,
@@ -1880,17 +1911,32 @@ impl AppState {
     /// How long a toast stays on screen before auto-dismissing.
     pub const TOAST_DURATION: Duration = Duration::from_millis(2500);
 
-    /// Show a transient toast message (reusable anywhere — diff "no changes", copy confirmations…).
+    /// Show a transient toast message (reusable anywhere — diff "no changes", view toggles…).
     pub fn show_toast(&mut self, message: impl Into<String>) {
-        self.toast = Some((message.into(), Instant::now()));
+        self.toast = Some(Toast {
+            message: message.into(),
+            preview: Vec::new(),
+            shown_at: Instant::now(),
+        });
     }
 
-    /// The toast text if one is currently visible (un-expired), else None.
-    pub fn active_toast(&self) -> Option<&str> {
+    /// Max preview lines in a copy-confirmation toast.
+    pub const COPY_PREVIEW_LINES: usize = 3;
+
+    /// Confirm a clipboard copy: toast with the first few lines of what was copied.
+    pub fn show_copy_toast(&mut self, copied: &str) {
+        self.toast = Some(Toast {
+            message: "copied to clipboard".into(),
+            preview: copy_preview(copied),
+            shown_at: Instant::now(),
+        });
+    }
+
+    /// The toast if one is currently visible (un-expired), else None.
+    pub fn active_toast(&self) -> Option<&Toast> {
         self.toast
             .as_ref()
-            .filter(|(_, shown_at)| shown_at.elapsed() < Self::TOAST_DURATION)
-            .map(|(message, _)| message.as_str())
+            .filter(|toast| toast.shown_at.elapsed() < Self::TOAST_DURATION)
     }
 
     /// Number of rows in the `y` copy menu.
@@ -3467,6 +3513,7 @@ impl AppState {
 
     pub fn toggle_column(&mut self, column: Column) {
         match column {
+            Column::Status => self.columns.status = !self.columns.status,
             Column::AheadBehind => self.columns.ahead_behind = !self.columns.ahead_behind,
             Column::Dirty => self.columns.dirty = !self.columns.dirty,
             Column::LastCommit => self.columns.last_commit = !self.columns.last_commit,
@@ -3482,7 +3529,7 @@ impl AppState {
     /// (ahead/behind, dirty, last-commit) are never hidden.
     pub fn column_available(&self, column: Column) -> bool {
         match column {
-            Column::AheadBehind | Column::Dirty | Column::LastCommit => true,
+            Column::Status | Column::AheadBehind | Column::Dirty | Column::LastCommit => true,
             Column::Worktrees => {
                 if !self.worktrees_done {
                     return true;
@@ -3520,6 +3567,7 @@ impl AppState {
     /// The columns actually rendered: enabled flags minus any that are currently unavailable.
     pub fn effective_columns(&self) -> ColumnFlags {
         ColumnFlags {
+            status: self.columns.status,
             ahead_behind: self.columns.ahead_behind,
             dirty: self.columns.dirty,
             last_commit: self.columns.last_commit,
@@ -3546,6 +3594,21 @@ mod tests {
         state.tree_enabled = false;
         state.collapsed_folders.clear();
         state
+    }
+
+    #[test]
+    fn copy_preview_short_text_keeps_all_lines() {
+        assert_eq!(copy_preview("/home/user/repo"), vec!["/home/user/repo"]);
+        assert_eq!(copy_preview("one\ntwo"), vec!["one", "two"]);
+        assert_eq!(copy_preview("one\ntwo\nthree"), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn copy_preview_long_text_truncates_with_marker() {
+        assert_eq!(
+            copy_preview("one\ntwo\nthree\nfour\nfive"),
+            vec!["one", "two", "three", "… +2 more lines"]
+        );
     }
 
     fn state_with(statuses: &[RepoStatus]) -> AppState {

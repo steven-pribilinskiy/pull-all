@@ -131,3 +131,7 @@ ref was fetched") is treated the same way — nothing to pull, not a red failure
 If any repo fails, a dynamic **Errors (N)** row appears right after Result; select it to see
 each failed repo with the tail of its error output. A failed pull is retried once automatically
 before it's marked failed, so transient network or lock hiccups usually clear themselves.
+Permanent errors — repository not found, authentication/access failures, a diverged branch
+that can't fast-forward — skip the retry and fail immediately, since retrying can't change
+the result. The optional [status column](../../guides/columns-and-glyphs/) (`t` `u`) names
+the failure kind right in the list.

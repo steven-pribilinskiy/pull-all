@@ -17,12 +17,20 @@ Press `t` to enter the column-toggle leader, then a column key. The mode stays a
 
 | Key | Column | Glyph |
 |-----|--------|-------|
+| `u` | Status text | short label, see below |
 | `a` | Ahead / behind vs upstream | `↑N ↓N` |
 | `d` | Dirty (uncommitted file count) | `•N` (amber) |
 | `l` | Last-commit age | relative date |
 | `w` | Worktree count | `⑃N` (cyan) |
 | `b` | Feature-branch count (local branches excluding `main`/`dev`) | `⑂N` (green) |
 | `s` | Stash count | `≡N` |
+
+The **status** column spells the glyph out as a short label (`queued`, `running`,
+`up-to-date`, `updated`, `no upstream`, `dirty`, `throttled`), and gets more specific where
+the state has a known cause: a failed repo shows its failure kind — `not found` (repo deleted
+or no access), `auth`, `diverged` (can't fast-forward), `not a repo`, `timeout`, `network`,
+or `lock` — and a branch whose tracked remote ref was deleted shows `ref gone` instead of a
+generic `no upstream`. Same colors as the glyphs.
 
 Enabled columns persist across runs. Count columns render a **dim zero** (`⑃0`, `≡0`) rather
 than a blank, so the column stays recognizable. The dirty marker is **amber**, not red —

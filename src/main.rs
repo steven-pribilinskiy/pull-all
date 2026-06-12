@@ -457,6 +457,7 @@ fn dispatch_command(
         Cmd::CopyPath => {
             if let Some(idx) = app.selected_repo_index() {
                 let path = app.repos[idx].lock().unwrap().path.display().to_string();
+                app.show_copy_toast(&path);
                 copy_to_clipboard(&path);
             }
         }
@@ -465,6 +466,7 @@ fn dispatch_command(
                 .selected_repo_index()
                 .and_then(|idx| app.repos[idx].lock().unwrap().remote_url.clone());
             if let Some(url) = url {
+                app.show_copy_toast(&url);
                 copy_to_clipboard(&url);
             }
         }
@@ -991,6 +993,7 @@ async fn run_event_loop(
                             let text = app.repo_page_target().map(|row| app.copy_menu_text(&row));
                             app.copy_menu = None;
                             if let Some(text) = text {
+                                app.show_copy_toast(&text);
                                 drop(app);
                                 copy_to_clipboard(&text);
                             }
@@ -1194,7 +1197,10 @@ async fn run_event_loop(
                             // Click an info-block link / copy button / expandable value.
                             match action {
                                 InfoAction::OpenUrl(url) => open_url(&url),
-                                InfoAction::CopyText(text) => copy_to_clipboard(&text),
+                                InfoAction::CopyText(text) => {
+                                    app.show_copy_toast(&text);
+                                    copy_to_clipboard(&text);
+                                }
                                 InfoAction::ToggleExpand(field) => app.toggle_info_expanded(&field),
                             }
                         } else {
@@ -1393,6 +1399,7 @@ async fn run_event_loop(
                                 app.repo_page_target().map(|row| app.copy_menu_text(&row));
                             app.copy_menu = None;
                             if let Some(text) = text {
+                                app.show_copy_toast(&text);
                                 drop(app);
                                 copy_to_clipboard(&text);
                                 continue;
@@ -1845,6 +1852,7 @@ async fn run_event_loop(
                         }
                     };
                     match key.code {
+                        KeyCode::Char('u') => app.toggle_column(Column::Status),
                         KeyCode::Char('a') => app.toggle_column(Column::AheadBehind),
                         KeyCode::Char('d') => app.toggle_column(Column::Dirty),
                         KeyCode::Char('l') => app.toggle_column(Column::LastCommit),
@@ -2146,6 +2154,7 @@ async fn run_event_loop(
                     (KeyCode::Char('y'), _) => {
                         if let Some(idx) = app.selected_repo_index() {
                             let path = app.repos[idx].lock().unwrap().path.display().to_string();
+                            app.show_copy_toast(&path);
                             drop(app);
                             copy_to_clipboard(&path);
                         }
@@ -2156,6 +2165,7 @@ async fn run_event_loop(
                             .selected_repo_index()
                             .and_then(|idx| app.repos[idx].lock().unwrap().remote_url.clone());
                         if let Some(url) = url {
+                            app.show_copy_toast(&url);
                             drop(app);
                             copy_to_clipboard(&url);
                         }

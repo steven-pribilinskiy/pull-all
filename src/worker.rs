@@ -13,7 +13,7 @@ use crate::app::{
 };
 use crate::git::{
     base_file_list, base_merge_base, branch_diff_stats, branch_file_diff, branch_file_list,
-    checkout_branch, classify_pull_output, default_base_branch, delete_branch, dirty_count,
+    checkout_branch, classify_failure, classify_pull_output, default_base_branch, delete_branch, dirty_count,
     diff_stat, discard_changes, discard_status, discover_worktrees, drop_stash, fetch_ff_branch,
     fetch_remote, file_diff_vs, get_branch, get_diff, get_remote_url, get_repo_details, is_dirty,
     list_local_branches, list_stashes, list_worktrees, merge_base_with, pull_all_branches,
@@ -37,6 +37,7 @@ pub async fn pull_repo(
         let mut state = repo_state.lock().unwrap();
         state.start = Some(started);
         state.elapsed = None;
+        state.status_note = None;
         (state.path.clone(), state.name.clone())
     };
 
@@ -60,12 +61,22 @@ pub async fn pull_repo(
     }
 
     // Run the pull, retrying once on failure (transient network/lock issues are common).
-    // Status stays Running across both attempts; the log keeps the first failure's output.
+    // Permanent errors (repo gone, auth failure, diverged branch) skip the retry — it can't
+    // change the result. Status stays Running across both attempts; the log keeps the first
+    // failure's output.
     const MAX_ATTEMPTS: u32 = 2;
     let mut outcome = PullOutcome::Failed;
+    let mut failure = None;
+    let mut last_output = String::new();
     for attempt in 0..MAX_ATTEMPTS {
-        outcome = run_pull_attempt(&repo_state, &path, timeout_secs).await?;
+        let (attempt_outcome, output) = run_pull_attempt(&repo_state, &path, timeout_secs).await?;
+        outcome = attempt_outcome;
+        last_output = output;
         if !matches!(outcome, PullOutcome::Failed) {
+            break;
+        }
+        failure = classify_failure(&last_output);
+        if failure.is_some_and(|kind| kind.permanent) {
             break;
         }
         if attempt + 1 < MAX_ATTEMPTS {
@@ -89,6 +100,8 @@ pub async fn pull_repo(
             let mut state = repo_state.lock().unwrap();
             state.elapsed = Some(elapsed);
             state.status = RepoStatus::NoUpstream;
+            // Distinguish "never had an upstream" from "tracked ref was deleted (PR merged)".
+            state.status_note = last_output.contains("no such ref was fetched").then_some("ref gone");
             state
                 .log
                 .push(format!("{} {name} has no upstream — nothing to pull", icons.skip_log));
@@ -133,6 +146,7 @@ pub async fn pull_repo(
             let mut state = repo_state.lock().unwrap();
             state.elapsed = Some(elapsed);
             state.status = RepoStatus::Failed;
+            state.status_note = failure.map(|kind| kind.label);
         }
     }
 
@@ -161,12 +175,13 @@ pub async fn run_governor(control: Arc<ThrottleControl>) {
 }
 
 /// Run one `git pull --ff-only` attempt: spawn it (under `timeout`), set the repo Running,
-/// stream stdout/stderr into the log, and classify the result. Used by `pull_repo`'s retry loop.
+/// stream stdout/stderr into the log, and classify the result. Returns the outcome plus the
+/// combined output so `pull_repo`'s retry loop can classify the failure kind.
 async fn run_pull_attempt(
     repo_state: &SharedRepoState,
     path: &std::path::Path,
     timeout_secs: u64,
-) -> Result<PullOutcome> {
+) -> Result<(PullOutcome, String)> {
     let mut child = Command::new("timeout")
         .args([
             &timeout_secs.to_string(),
@@ -218,9 +233,19 @@ async fn run_pull_attempt(
 
     let stdout_output = stdout_task.await.unwrap_or_default();
     let stderr_output = stderr_task.await.unwrap_or_default();
-    let combined = format!("{stdout_output}{stderr_output}");
+    let mut combined = format!("{stdout_output}{stderr_output}");
 
-    Ok(classify_pull_output(&combined, exit_success))
+    // `timeout` kills git with exit code 124 and no explanation in the output — say so in the
+    // log (and in `combined`, so the failure classifies as a timeout).
+    if status.code() == Some(124) {
+        let line = format!("pull timed out after {timeout_secs}s");
+        repo_state.lock().unwrap().log.push(line.clone());
+        combined.push_str(&line);
+        combined.push('\n');
+    }
+
+    let outcome = classify_pull_output(&combined, exit_success);
+    Ok((outcome, combined))
 }
 
 /// Discover worktrees across every parent directory of the discovered repos (worktrees live as

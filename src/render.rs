@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     AppState, ClickRegion, Column, ColumnFlags, Command, DiffFocus, DiffMode, DiffSource, HelpTab,
-    IconSet, InfoAction, Leader, ListRow, PageRow, PageRowKind, RepoPageColumn, RepoStatus,
-    RightView, ScrollHit, ScrollKind, SortColumn, SortDir, StatusFilter,
+    IconSet, InfoAction, Leader, ListRow, PageRow, PageRowKind, RepoPageColumn, RepoState,
+    RepoStatus, RightView, ScrollHit, ScrollKind, SortColumn, SortDir, StatusFilter,
 };
 
 /// The published documentation site (opened by the `D` hotkey and linked in the help modal).
@@ -481,7 +481,8 @@ fn render_list(frame: &mut Frame, app: &mut AppState, area: Rect, tick: u64) -> 
     let col_extra = usize::from(emoji);
     let dirty_w = 3 + col_extra; // glyph + up to 2 digits
     let count_w = 4 + col_extra; // glyph + count (worktrees / branches / stashes)
-    let columns_width = usize::from(columns.ahead_behind) * 10
+    let columns_width = usize::from(columns.status) * (STATUS_COL_W + 1)
+        + usize::from(columns.ahead_behind) * 10
         + (dirty_w + 1)
         + usize::from(columns.last_commit) * 15
         + usize::from(columns.worktrees) * (count_w + 1)
@@ -553,6 +554,14 @@ fn render_list(frame: &mut Frame, app: &mut AppState, area: Rect, tick: u64) -> 
                 format!("{branch_truncated:<branch_col_width$}"),
                 Style::default().fg(Color::Cyan),
             ));
+
+            if columns.status {
+                let text = status_short(&state);
+                spans.push(Span::styled(
+                    format!(" {}", pad_display(text, STATUS_COL_W)),
+                    flash_style(Style::default().fg(status_color(&state.status)), flash.status),
+                ));
+            }
 
             if columns.ahead_behind {
                 spans.push(Span::raw(" "));
@@ -796,6 +805,9 @@ fn build_list_header(
         Cell { label: "", width: 1, lead: false, sort: None },
         Cell { label: "branch", width: branch_col_width, lead: false, sort: Some(SortColumn::Branch) },
     ];
+    if columns.status {
+        cells.push(Cell { label: "status", width: STATUS_COL_W, lead: true, sort: Some(SortColumn::Status) });
+    }
     if columns.ahead_behind {
         cells.push(Cell { label: "↑↓", width: 9, lead: true, sort: Some(SortColumn::AheadBehind) });
     }
@@ -995,6 +1007,32 @@ fn finish_header_line(head: Vec<Span<'static>>, tail: Vec<Span<'static>>, inner_
     spans.push(Span::styled(format!(" {}", "─".repeat(fill)), Style::default().fg(Color::DarkGray)));
     spans.extend(tail);
     ListItem::new(Line::from(spans))
+}
+
+/// Width of the optional status text column — fits the longest label ("no upstream").
+const STATUS_COL_W: usize = 11;
+
+/// Short status-column text: the recorded failure/skip qualifier when known ("not found",
+/// "auth", "diverged", "ref gone", …), else the plain status label.
+fn status_short(state: &RepoState) -> &'static str {
+    match state.status {
+        RepoStatus::Failed => state.status_note.unwrap_or("failed"),
+        RepoStatus::Skipped => "dirty",
+        RepoStatus::NoUpstream => state.status_note.unwrap_or("no upstream"),
+        ref status => status_label(status),
+    }
+}
+
+/// The semantic color a status renders with (same mapping as its glyph).
+fn status_color(status: &RepoStatus) -> Color {
+    match status {
+        RepoStatus::Queued | RepoStatus::NoUpstream | RepoStatus::Skipped => Color::DarkGray,
+        RepoStatus::Running { .. } => Color::Yellow,
+        RepoStatus::UpToDate => Color::Gray,
+        RepoStatus::Updated => Color::Green,
+        RepoStatus::Throttled => Color::Magenta,
+        RepoStatus::Failed => Color::Red,
+    }
 }
 
 /// Human-readable label for a repo's status.
@@ -2120,6 +2158,7 @@ fn render_status_bar(frame: &mut Frame, app: &mut AppState, area: Rect) {
         let mut segments: Vec<(String, Style, Option<Command>)> =
             vec![("cols: ".to_string(), hint, None)];
         let entries = [
+            toggle_item(columns.status, "u", "status", Column::Status),
             toggle_item(columns.ahead_behind, "a", "ahead/behind", Column::AheadBehind),
             toggle_item(columns.dirty, "d", "dirty", Column::Dirty),
             toggle_item(columns.last_commit, "l", "last-commit", Column::LastCommit),
@@ -4286,16 +4325,24 @@ fn render_throttle_banner(frame: &mut Frame, app: &AppState, area: Rect) {
 /// Render the transient toast (reusable, app-wide): a small rounded notice near the bottom-center
 /// that auto-dismisses. Call last so it overlays everything; no-op when no toast is active.
 fn render_toast(frame: &mut Frame, app: &AppState, area: Rect) {
-    let Some(message) = app.active_toast() else {
+    let Some(toast) = app.active_toast() else {
         return;
     };
     // Nothing legible fits in a sliver of a terminal — skip (and avoid a min>max clamp panic).
     if area.width < 8 || area.height < 3 {
         return;
     }
-    let text = format!("  {message}  ");
-    let width = (UnicodeWidthStr::width(text.as_str()) as u16 + 2).clamp(8, area.width);
-    let height = 3u16;
+    let text = format!("  {}  ", toast.message);
+    // Wide enough for the headline and every preview line (clamped to the terminal).
+    let content_width = toast
+        .preview
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()) + 4)
+        .chain(std::iter::once(UnicodeWidthStr::width(text.as_str())))
+        .max()
+        .unwrap_or(0);
+    let width = (content_width as u16 + 2).clamp(8, area.width);
+    let height = (3 + toast.preview.len() as u16).min(area.height);
     let toast_area = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height + 3),
@@ -4310,12 +4357,17 @@ fn render_toast(frame: &mut Frame, app: &AppState, area: Rect) {
     cast_shadow(frame, toast_area);
     frame.render_widget(Clear, toast_area);
     frame.render_widget(block, toast_area);
-    frame.render_widget(
-        Paragraph::new(
-            Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD))).centered(),
-        ),
-        inner,
-    );
+    let mut lines = vec![
+        Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD))).centered(),
+    ];
+    let preview_width = inner.width.saturating_sub(4) as usize;
+    for preview in &toast.preview {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", truncate_str(preview, preview_width)),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render the repo-page `y` copy menu: pick what to copy — path, branch, or both.

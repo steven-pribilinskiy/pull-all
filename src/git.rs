@@ -41,6 +41,59 @@ fn looks_throttled(lower: &str) -> bool {
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+/// One recognized failure flavor from a failed pull's output: a short label for the status
+/// column and whether an immediate retry could ever change the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureKind {
+    pub label: &'static str,
+    pub permanent: bool,
+}
+
+/// Match a failed pull's output against the known failure flavors (first match wins; checked
+/// on a lowercased copy). Permanent kinds — missing/inaccessible repo, auth failure, a branch
+/// state `--ff-only` will always reject — skip the automatic retry; transient kinds keep it
+/// but still get a specific status label. Throttling is classified separately ([`PullOutcome`])
+/// and never reaches this check.
+pub fn classify_failure(output: &str) -> Option<FailureKind> {
+    const PERMANENT: bool = true;
+    const TRANSIENT: bool = false;
+    const KINDS: &[(&str, &str, bool)] = &[
+        ("repository not found", "not found", PERMANENT), // ssh: "ERROR: Repository not found."
+        ("the requested url returned error: 404", "not found", PERMANENT),
+        ("authentication failed", "auth", PERMANENT),
+        ("invalid username or password", "auth", PERMANENT),
+        ("support for password authentication was removed", "auth", PERMANENT),
+        ("permission denied", "auth", PERMANENT), // ssh: "Permission denied (publickey)."
+        ("access denied", "auth", PERMANENT),
+        ("the requested url returned error: 403", "auth", PERMANENT),
+        ("not possible to fast-forward", "diverged", PERMANENT),
+        ("need to specify how to reconcile divergent branches", "diverged", PERMANENT),
+        ("refusing to merge unrelated histories", "diverged", PERMANENT),
+        ("not a git repository", "not a repo", PERMANENT),
+        ("timed out", "timeout", TRANSIENT),
+        ("could not resolve host", "network", TRANSIENT),
+        ("connection refused", "network", TRANSIENT),
+        ("no route to host", "network", TRANSIENT),
+        ("network is unreachable", "network", TRANSIENT),
+        ("cannot lock ref", "lock", TRANSIENT),
+        ("index.lock", "lock", TRANSIENT),
+    ];
+    let lower = output.to_lowercase();
+    for &(marker, label, permanent) in KINDS {
+        if lower.contains(marker) {
+            return Some(FailureKind { label, permanent });
+        }
+    }
+    // https not-found form: "fatal: repository 'https://…' not found" (URL between the words).
+    if lower
+        .lines()
+        .any(|line| line.contains("fatal: repository") && line.contains("not found"))
+    {
+        return Some(FailureKind { label: "not found", permanent: true });
+    }
+    None
+}
+
 /// Parse combined stdout+stderr from `git pull` to determine outcome.
 /// `exit_success` — did the process exit with code 0?
 pub fn classify_pull_output(output: &str, exit_success: bool) -> PullOutcome {
@@ -1464,6 +1517,47 @@ mod tests {
         );
         assert_eq!(normalize_remote_url(""), None);
         assert_eq!(normalize_remote_url("/local/path/repo"), None);
+    }
+
+    #[test]
+    fn classify_failure_detects_permanent_kinds() {
+        let cases: &[(&str, &str)] = &[
+            // ssh form (GitHub) and https form (URL between "repository" and "not found")
+            ("ERROR: Repository not found.\nfatal: Could not read from remote repository.\n", "not found"),
+            ("fatal: repository 'https://github.com/org/gone.git/' not found\n", "not found"),
+            ("git@github.com: Permission denied (publickey).\n", "auth"),
+            ("fatal: Authentication failed for 'https://github.com/org/repo.git/'\n", "auth"),
+            ("remote: Invalid username or password.\n", "auth"),
+            ("fatal: unable to access 'https://host/repo.git/': The requested URL returned error: 403\n", "auth"),
+            ("fatal: Not possible to fast-forward, aborting.\n", "diverged"),
+            ("fatal: Need to specify how to reconcile divergent branches.\n", "diverged"),
+            ("fatal: refusing to merge unrelated histories\n", "diverged"),
+            ("fatal: not a git repository (or any of the parent directories): .git\n", "not a repo"),
+        ];
+        for (output, label) in cases {
+            let kind = classify_failure(output).unwrap_or_else(|| panic!("{output:?} should classify"));
+            assert_eq!(kind.label, *label, "{output:?}");
+            assert!(kind.permanent, "{output:?} should be permanent");
+        }
+    }
+
+    #[test]
+    fn classify_failure_keeps_transient_kinds_retryable() {
+        let cases: &[(&str, &str)] = &[
+            ("fatal: unable to access 'https://github.com/org/repo.git/': Could not resolve host: github.com\n", "network"),
+            ("ssh: connect to host github.com port 22: Connection timed out\n", "timeout"),
+            ("pull timed out after 30s\n", "timeout"),
+            ("error: cannot lock ref 'refs/remotes/origin/main'\n", "lock"),
+            ("fatal: Unable to create '/repo/.git/index.lock': File exists.\n", "lock"),
+        ];
+        for (output, label) in cases {
+            let kind = classify_failure(output).unwrap_or_else(|| panic!("{output:?} should classify"));
+            assert_eq!(kind.label, *label, "{output:?}");
+            assert!(!kind.permanent, "{output:?} should stay retryable");
+        }
+        // Unknown output: no kind, retry stays on.
+        assert_eq!(classify_failure("some brand-new git error\n"), None);
+        assert_eq!(classify_failure(""), None);
     }
 
     #[test]
