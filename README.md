@@ -35,13 +35,22 @@ Interactive polyrepo git dashboard. Discovers every git repo under a directory a
 - Non-TUI fallback (same output as bash reference) when not on a TTY or with `--no-tui`
 - Exit codes: 0 (all ok), 1 (any failed), 2 (user quit mid-run), 130 (Ctrl-C)
 
-## Building
+## Installing
+
+polygit is a single binary for **Linux and macOS** (on Windows, use WSL).
 
 ```bash
-# Requires Rust stable (cargo)
-make build              # binary at: bin/polygit
-make install            # also copies to ~/bin/polygit
+# Install script — grabs the prebuilt binary for your platform
+curl -fsSL https://steven-pribilinskiy.github.io/polygit/install.sh | bash
+
+# Or with cargo (no clone needed)
+cargo install --git https://github.com/steven-pribilinskiy/polygit
+
+# Or from source (also installs the bash/Go/Bun siblings)
+make install            # release build → ~/bin/polygit
 ```
+
+See the [installation docs](https://steven-pribilinskiy.github.io/polygit/start/installation/) for details.
 
 ## Running
 
