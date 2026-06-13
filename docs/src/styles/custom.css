@@ -69,6 +69,225 @@
   text-decoration-thickness: 1px;
 }
 
+/* =====================================================================
+   Interactive keyboard viewer (keybindings page).
+   ===================================================================== */
+.kbviz__open {
+  margin: 0 0 1.5rem;
+}
+.kbviz__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000; /* above Starlight's navbar + search */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2vh 2vw;
+  background: color-mix(in srgb, var(--sl-color-black, #000) 62%, transparent);
+  backdrop-filter: blur(2px);
+}
+.kbviz__backdrop[hidden] {
+  display: none;
+}
+.kbviz__panel {
+  display: flex;
+  flex-direction: column;
+  width: 90vw;
+  height: 90vh;
+  background: var(--sl-color-bg);
+  border: 1px solid var(--term-border);
+  border-radius: 0.8rem;
+  box-shadow: 0 24px 70px -30px oklch(0 0 0 / 0.6);
+  overflow: hidden;
+}
+.kbviz__bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--sl-color-gray-6, var(--term-border));
+  font-family: var(--font-mono);
+}
+.kbviz__title {
+  font-weight: 700;
+  color: var(--sl-color-white);
+}
+.kbviz__os {
+  display: inline-flex;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.kbviz__os button {
+  padding: 0.35rem 0.7rem;
+  font-family: var(--font-mono);
+  font-size: var(--sl-text-xs);
+  color: var(--sl-color-gray-2);
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--sl-color-gray-5);
+  cursor: pointer;
+}
+.kbviz__os button:last-child {
+  border-right: 0;
+}
+.kbviz__os button[aria-pressed='true'] {
+  color: #fff;
+  background: var(--sl-color-accent);
+}
+:root[data-theme='dark'] .kbviz__os button[aria-pressed='true'] {
+  color: oklch(0.18 0.02 152);
+}
+.kbviz__legend {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: var(--sl-text-xs);
+  color: var(--sl-color-gray-3);
+}
+.kbviz__swatch {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 0.2rem;
+  background: var(--sl-color-accent-low);
+  border: 1px solid var(--sl-color-accent);
+}
+.kbviz__close {
+  width: 2rem;
+  height: 2rem;
+  font-size: 1rem;
+  color: var(--sl-color-gray-2);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+.kbviz__close:hover {
+  color: var(--sl-color-accent);
+  background: var(--sl-color-gray-7, var(--sl-color-bg-sidebar));
+}
+.kbviz__os button:focus-visible,
+.kbviz__close:focus-visible,
+.kbviz__key:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+}
+.kbviz__stage {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  overflow: auto;
+}
+.kbviz__keyboard {
+  display: flex;
+  align-items: flex-end;
+  gap: 1.25rem;
+  font-family: var(--font-mono);
+}
+.kbviz__main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.kbviz__row {
+  display: flex;
+  gap: 0.4rem;
+}
+.kbviz__key {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.4rem;
+  height: 2.7rem;
+  padding: 0 0.3rem;
+  font-size: var(--sl-text-xs);
+  color: var(--sl-color-gray-2);
+  background: var(--sl-color-bg-sidebar);
+  border: 1px solid var(--sl-color-gray-5);
+  border-bottom-width: 2px;
+  border-radius: 0.4rem;
+  white-space: nowrap;
+  user-select: none;
+}
+.kbviz__key.is-bound {
+  color: var(--sl-color-accent-high);
+  background: var(--sl-color-accent-low);
+  border-color: var(--sl-color-accent);
+  font-weight: 700;
+  cursor: help;
+}
+:root[data-theme='dark'] .kbviz__key.is-bound {
+  color: var(--sl-color-white);
+}
+.kbviz__key.is-bound:hover {
+  background: color-mix(in srgb, var(--sl-color-accent) 28%, var(--sl-color-bg-sidebar));
+}
+.kbviz__key.is-dim {
+  opacity: 0.55;
+}
+.kbviz__side {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+.kbviz__nav,
+.kbviz__arrows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.kbviz__arrows .kbviz__arrow-top {
+  justify-content: center;
+}
+.kbviz__tooltip {
+  position: fixed;
+  z-index: 1001;
+  max-width: 22rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.6rem 0.75rem;
+  font-size: var(--sl-text-xs);
+  color: var(--term-ink);
+  background: var(--term-bg);
+  border: 1px solid var(--term-border);
+  border-radius: 0.5rem;
+  box-shadow: 0 10px 30px -12px oklch(0 0 0 / 0.5);
+  pointer-events: none;
+}
+.kbviz__tooltip[hidden] {
+  display: none;
+}
+.kbviz__tooltip strong {
+  color: var(--sl-color-accent);
+  font-family: var(--font-mono);
+}
+.kbviz__tooltip span {
+  display: block;
+}
+.kbviz__tooltip kbd {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  padding: 0.1rem 0.3rem;
+  color: var(--term-ink);
+  background: color-mix(in srgb, var(--term-ink) 12%, transparent);
+  border-radius: 0.25rem;
+  margin-right: 0.3rem;
+}
+
+@media (max-width: 50rem) {
+  .kbviz__keyboard {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .kbviz__legend {
+    display: none;
+  }
+}
+
 /* Theme toggle button (replaces Starlight's native select). */
 .theme-toggle {
   display: inline-flex;

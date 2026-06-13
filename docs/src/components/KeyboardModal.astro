@@ -1,0 +1,233 @@
+---
+/**
+ * A button that opens a full-screen (90vw × 90vh) modal rendering an OS-aware keyboard.
+ * Keys bound to a polygit action are highlighted; hovering one shows its action(s) in a tooltip.
+ * The key → action map is built at runtime from the same keymap.ts the explorer uses.
+ */
+---
+
+<div class="kbviz" data-kbviz>
+  <button type="button" class="kbviz__open btn-term btn-term--ghost" data-kbviz-open>
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="2" y="6" width="20" height="12" rx="2"></rect>
+      <path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M10 14h4"></path>
+    </svg>
+    Show the keyboard
+  </button>
+
+  <div class="kbviz__backdrop" data-kbviz-modal hidden>
+    <div class="kbviz__panel" role="dialog" aria-modal="true" aria-label="polygit keyboard map">
+      <header class="kbviz__bar">
+        <span class="kbviz__title">polygit keyboard</span>
+        <div class="kbviz__os" role="group" aria-label="Keyboard layout">
+          <button type="button" data-kbviz-os="mac">macOS</button>
+          <button type="button" data-kbviz-os="windows">Windows</button>
+          <button type="button" data-kbviz-os="linux">Linux</button>
+        </div>
+        <span class="kbviz__legend"><i class="kbviz__swatch"></i> bound — hover for the action</span>
+        <button type="button" class="kbviz__close" data-kbviz-close aria-label="Close">✕</button>
+      </header>
+      <div class="kbviz__stage">
+        <div class="kbviz__keyboard" data-kbviz-keyboard></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="kbviz__tooltip" data-kbviz-tooltip hidden></div>
+</div>
+
+<script>
+  import { keymap } from '../data/keymap';
+
+  type OS = 'mac' | 'windows' | 'linux';
+  type Bound = { combo: string; action: string };
+
+  // --- map a keymap token to a physical key `code` (+ whether Shift is required) ---
+  const NON_KEYS = new Set(['click', 'double-click', 'wheel']);
+  const NAMED: Record<string, string> = {
+    '↑': 'ArrowUp', '↓': 'ArrowDown', '←': 'ArrowLeft', '→': 'ArrowRight',
+    Space: 'Space', Enter: 'Enter', Esc: 'Escape', Tab: 'Tab',
+    Home: 'Home', End: 'End', PgUp: 'PageUp', PgDn: 'PageDown',
+    Ctrl: 'ControlLeft', Shift: 'ShiftLeft',
+    '[': 'BracketLeft', ']': 'BracketRight', '/': 'Slash', ',': 'Comma',
+    '-': 'Minus', '=': 'Equal', '.': 'Period', ';': 'Semicolon',
+  };
+  const SHIFTED: Record<string, string> = { '?': 'Slash', '+': 'Equal', '*': 'Digit8' };
+
+  function resolve(token: string): { code: string; shift: boolean } | null {
+    if (NON_KEYS.has(token)) return null;
+    if (NAMED[token]) return { code: NAMED[token], shift: false };
+    if (SHIFTED[token]) return { code: SHIFTED[token], shift: true };
+    if (/^[a-z]$/.test(token)) return { code: 'Key' + token.toUpperCase(), shift: false };
+    if (/^[A-Z]$/.test(token)) return { code: 'Key' + token, shift: true };
+    if (/^[0-9]$/.test(token)) return { code: 'Digit' + token, shift: false };
+    return null;
+  }
+
+  // physical code -> list of {combo, action}
+  const bound = new Map<string, Bound[]>();
+  const add = (code: string, b: Bound) => {
+    const list = bound.get(code) ?? [];
+    if (!list.some((x) => x.combo === b.combo && x.action === b.action)) list.push(b);
+    bound.set(code, list);
+  };
+  for (const section of keymap) {
+    for (const binding of section.bindings) {
+      const tokens = binding.keys.filter((k) => !NON_KEYS.has(k));
+      if (!tokens.length) continue;
+      const combo = tokens.join(' ');
+      let needsShift = false;
+      for (const token of tokens) {
+        const r = resolve(token);
+        if (!r) continue;
+        add(r.code, { combo, action: binding.action });
+        if (r.shift) needsShift = true;
+      }
+      if (needsShift) add('ShiftLeft', { combo, action: binding.action });
+    }
+  }
+
+  // --- keyboard layout. Each key: [code, label, widthUnits?]. macOS overrides for the bottom row. ---
+  type Key = [code: string, label: string, w?: number];
+  const mainRows: Key[][] = [
+    [['Escape', 'esc', 1.5], ['Backquote', '`'], ['Digit1', '1'], ['Digit2', '2'], ['Digit3', '3'], ['Digit4', '4'], ['Digit5', '5'], ['Digit6', '6'], ['Digit7', '7'], ['Digit8', '8'], ['Digit9', '9'], ['Digit0', '0'], ['Minus', '-'], ['Equal', '='], ['Backspace', '⌫', 2]],
+    [['Tab', 'tab', 1.5], ['KeyQ', 'Q'], ['KeyW', 'W'], ['KeyE', 'E'], ['KeyR', 'R'], ['KeyT', 'T'], ['KeyY', 'Y'], ['KeyU', 'U'], ['KeyI', 'I'], ['KeyO', 'O'], ['KeyP', 'P'], ['BracketLeft', '['], ['BracketRight', ']'], ['Backslash', '\\', 1.5]],
+    [['CapsLock', 'caps', 1.75], ['KeyA', 'A'], ['KeyS', 'S'], ['KeyD', 'D'], ['KeyF', 'F'], ['KeyG', 'G'], ['KeyH', 'H'], ['KeyJ', 'J'], ['KeyK', 'K'], ['KeyL', 'L'], ['Semicolon', ';'], ['Quote', "'"], ['Enter', '⏎', 2.25]],
+    [['ShiftLeft', '⇧', 2.25], ['KeyZ', 'Z'], ['KeyX', 'X'], ['KeyC', 'C'], ['KeyV', 'V'], ['KeyB', 'B'], ['KeyN', 'N'], ['KeyM', 'M'], ['Comma', ','], ['Period', '.'], ['Slash', '/'], ['ShiftRight', '⇧', 2.75]],
+  ];
+  const bottomRow = (os: OS): Key[] =>
+    os === 'mac'
+      ? [['ControlLeft', '⌃ ctrl', 1.5], ['AltLeft', '⌥ opt', 1.25], ['MetaLeft', '⌘ cmd', 1.5], ['Space', '', 6], ['MetaRight', '⌘', 1.5], ['AltRight', '⌥', 1.25], ['ControlRight', '⌃', 1.5]]
+      : [['ControlLeft', 'ctrl', 1.5], ['MetaLeft', os === 'windows' ? '⊞ win' : 'super', 1.25], ['AltLeft', 'alt', 1.5], ['Space', '', 6], ['AltRight', 'alt', 1.5], ['MetaRight', os === 'windows' ? '⊞' : 'super', 1.25], ['ControlRight', 'ctrl', 1.5]];
+  // Right-side nav + arrow cluster (polygit uses Home/End/PgUp/PgDn + arrows).
+  const navRows: Key[][] = [
+    [['Home', 'home'], ['PageUp', 'pgup']],
+    [['End', 'end'], ['PageDown', 'pgdn']],
+  ];
+  const arrowRows: Key[][] = [
+    [['ArrowUp', '↑']],
+    [['ArrowLeft', '←'], ['ArrowDown', '↓'], ['ArrowRight', '→']],
+  ];
+
+  function init(scope: ParentNode = document) {
+    scope.querySelectorAll<HTMLElement>('[data-kbviz]').forEach(setup);
+  }
+
+  function setup(el: HTMLElement) {
+    if (el.dataset.ready) return;
+    el.dataset.ready = 'true';
+    const openBtn = el.querySelector<HTMLButtonElement>('[data-kbviz-open]')!;
+    const modal = el.querySelector<HTMLElement>('[data-kbviz-modal]')!;
+    const tooltip = el.querySelector<HTMLElement>('[data-kbviz-tooltip]')!;
+    // Portal the overlay to <body> so a transformed/contained Starlight ancestor can't trap the
+    // fixed-position backdrop inside the content column.
+    document.body.appendChild(modal);
+    document.body.appendChild(tooltip);
+    const closeBtn = modal.querySelector<HTMLButtonElement>('[data-kbviz-close]')!;
+    const board = modal.querySelector<HTMLElement>('[data-kbviz-keyboard]')!;
+    const osButtons = [...modal.querySelectorAll<HTMLButtonElement>('[data-kbviz-os]')];
+
+    let os: OS = detectOS();
+
+    function detectOS(): OS {
+      const p = (
+        (navigator as any).userAgentData?.platform ||
+        navigator.platform ||
+        navigator.userAgent ||
+        ''
+      ).toLowerCase();
+      if (p.includes('mac')) return 'mac';
+      if (p.includes('win')) return 'windows';
+      return 'linux';
+    }
+
+    function keyEl([code, label, w]: Key): HTMLElement {
+      const div = document.createElement('div');
+      div.className = 'kbviz__key';
+      div.style.flexGrow = String(w ?? 1);
+      div.style.flexBasis = `${(w ?? 1) * 2.6}rem`;
+      div.textContent = label;
+      const acts = bound.get(code);
+      if (acts && acts.length) {
+        div.classList.add('is-bound');
+        div.tabIndex = 0;
+        div.dataset.code = code;
+        const show = () => {
+          tooltip.innerHTML =
+            `<strong>${label || code}</strong>` +
+            acts.map((a) => `<span><kbd>${a.combo}</kbd> ${a.action}</span>`).join('');
+          tooltip.hidden = false;
+          const r = div.getBoundingClientRect();
+          const tr = tooltip.getBoundingClientRect();
+          let left = r.left + r.width / 2 - tr.width / 2;
+          left = Math.max(8, Math.min(left, window.innerWidth - tr.width - 8));
+          let top = r.top - tr.height - 10;
+          if (top < 8) top = r.bottom + 10;
+          tooltip.style.left = `${left}px`;
+          tooltip.style.top = `${top}px`;
+        };
+        const hide = () => { tooltip.hidden = true; };
+        div.addEventListener('mouseenter', show);
+        div.addEventListener('mouseleave', hide);
+        div.addEventListener('focus', show);
+        div.addEventListener('blur', hide);
+      } else {
+        div.classList.add('is-dim');
+      }
+      return div;
+    }
+
+    function rowEl(keys: Key[], cls = ''): HTMLElement {
+      const row = document.createElement('div');
+      row.className = 'kbviz__row ' + cls;
+      keys.forEach((k) => row.appendChild(keyEl(k)));
+      return row;
+    }
+
+    function render() {
+      board.innerHTML = '';
+      const main = document.createElement('div');
+      main.className = 'kbviz__main';
+      [...mainRows, bottomRow(os)].forEach((r) => main.appendChild(rowEl(r)));
+
+      const side = document.createElement('div');
+      side.className = 'kbviz__side';
+      const nav = document.createElement('div');
+      nav.className = 'kbviz__nav';
+      navRows.forEach((r) => nav.appendChild(rowEl(r)));
+      const arrows = document.createElement('div');
+      arrows.className = 'kbviz__arrows';
+      arrowRows.forEach((r, i) => arrows.appendChild(rowEl(r, i === 0 ? 'kbviz__arrow-top' : '')));
+      side.append(nav, arrows);
+
+      board.append(main, side);
+      osButtons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.kbvizOs === os)));
+    }
+
+    function open() {
+      render();
+      modal.hidden = false;
+      document.documentElement.style.overflow = 'hidden';
+      closeBtn.focus();
+    }
+    function close() {
+      modal.hidden = true;
+      tooltip.hidden = true;
+      document.documentElement.style.overflow = '';
+      openBtn.focus();
+    }
+
+    openBtn.addEventListener('click', open);
+    closeBtn.addEventListener('click', close);
+    modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !modal.hidden) close();
+    });
+    osButtons.forEach((b) =>
+      b.addEventListener('click', () => { os = b.dataset.kbvizOs as OS; render(); })
+    );
+  }
+
+  init();
+  document.addEventListener('astro:page-load', () => init());
+</script>
